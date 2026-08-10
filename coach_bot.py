@@ -1,7 +1,6 @@
-from fastapi import FastAPI, Form, Request
-from fastapi.responses import Response
-from twilio.twiml.messaging_response import MessagingResponse
+from fastapi import FastAPI, Request
 from google import genai
+import requests
 import os
 
 app = FastAPI(title="Interactive AI Running Coach")
@@ -9,13 +8,11 @@ app = FastAPI(title="Interactive AI Running Coach")
 # --- CONTEXT MEMORY ---
 latest_run_context = "No recent runs logged."
 
-# Initialize the NEW Gemini Client using an environment variable
-# The client automatically picks up the GEMINI_API_KEY environment variable!
-client = genai.Client()
+# API Keys from Render Environment
+genai_client = genai.Client()
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
+TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
 
-# ==========================================
-# NEW: FIX FOR THE 404 ERROR
-# ==========================================
 @app.get("/")
 async def root():
     return {"message": "🏃 AI Running Coach Server is LIVE!"}
@@ -34,39 +31,41 @@ async def receive_health_data(request: Request):
         duration_mins = round(workout.get("duration", 0) / 60.0, 1)
         
         latest_run_context = f"User just completed {distance_miles} miles in {duration_mins} minutes."
-        
-        print("Run logged successfully!")
         return {"status": "success"}
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
 # ==========================================
-# 2. TWO-WAY WHATSAPP CHAT (TWILIO WEBHOOK)
+# 2. TWO-WAY TELEGRAM CHAT
 # ==========================================
-@app.post("/webhook/whatsapp")
-async def whatsapp_reply(Body: str = Form(...)):
-    user_message = Body
-    print(f"Received WhatsApp message: {user_message}")
-
-    system_prompt = f"""
-    You are an expert running coach. 
-    Your client is working on knee stability, glute strength, and doing 30/30 interval runs.
-    Context of their latest run: {latest_run_context}
-    Answer their questions concisely and supportively.
-    """
-
-    # Ask Gemini for advice using the new SDK format
-    full_prompt = f"{system_prompt}\n\nUser asks: {user_message}"
+@app.post("/webhook/telegram")
+async def telegram_reply(request: Request):
+    data = await request.json()
     
-    response = client.models.generate_content(
-        model="gemini-2.0-flash",
-        contents=full_prompt
-    )
-    
-    coach_reply_text = response.text
+    # Telegram sends a JSON payload. We extract the chat ID and the message text.
+    if "message" in data and "text" in data["message"]:
+        chat_id = data["message"]["chat"]["id"]
+        user_message = data["message"]["text"]
+        
+        system_prompt = f"""
+        You are an expert running coach. 
+        Your client is working on knee stability, glute strength, and doing 30/30 interval runs.
+        Context of their latest run: {latest_run_context}
+        Answer their questions concisely and supportively.
+        """
+        
+        # 1. Ask Gemini for advice
+        full_prompt = f"{system_prompt}\n\nUser asks: {user_message}"
+        ai_response = genai_client.models.generate_content(
+            model="gemini-2.0-flash",
+            contents=full_prompt
+        )
+        
+        # 2. Send the reply back to the user via Telegram
+        payload = {
+            "chat_id": chat_id,
+            "text": ai_response.text
+        }
+        requests.post(TELEGRAM_API_URL, json=payload)
 
-    # Format the response for Twilio
-    twiml_response = MessagingResponse()
-    twiml_response.message(coach_reply_text)
-
-    return Response(content=str(twiml_response), media_type="application/xml")
+    return {"status": "success"}
