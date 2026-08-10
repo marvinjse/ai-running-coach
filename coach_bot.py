@@ -1,62 +1,52 @@
 import os
 import requests
 from fastapi import FastAPI, Request
+from google import genai
 
 app = FastAPI()
 
-# Clean environment variables (strips any accidental spaces or hidden line breaks)
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+
+# Initialize Gemini Client
+ai_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
+
+def generate_ai_response(user_message: str) -> str:
+    if not ai_client:
+        return "AI Client not configured. Please set GEMINI_API_KEY on Render."
+    
+    prompt = f"""
+    You are an expert, encouraging AI Running Coach.
+    Answer the athlete's question concisely and accurately.
+    
+    Athlete: {user_message}
+    """
+    try:
+        response = ai_client.models.generate_content(
+            model="gemini-3.6-flash",
+            contents=prompt,
+        )
+        return response.text
+    except Exception as e:
+        print(f"LLM Error: {e}")
+        return "Sorry, I had trouble processing your coaching query!"
 
 def send_telegram_msg(chat_id, text):
-    """Sends a message back to Telegram."""
-    if not TELEGRAM_BOT_TOKEN:
-        print("ERROR: TELEGRAM_BOT_TOKEN environment variable is missing on Render!")
-        return
-        
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": chat_id,
-        "text": text,
-        "parse_mode": "Markdown"
-    }
-    
-    res = requests.post(url, json=payload)
-    print(f"Outgoing Telegram HTTP Status: {res.status_code}")
-    print(f"Telegram API Response: {res.text}")
+    payload = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
+    requests.post(url, json=payload)
 
-# 1. Web Browser Homepage (so visiting your Render URL in browser doesn't 404)
-@app.get("/")
-def home():
-    return {"status": "online", "message": "AI Running Coach API is active"}
-
-# 2. Webhook for Apple Health / HealthMirror data
-@app.post("/webhook/apple-health")
-async def receive_health_data(request: Request):
-    data = await request.json()
-    
-    workout_type = data.get("name", "Workout")
-    distance = data.get("totalDistance", "N/A")
-    duration = data.get("duration", "N/A")
-    
-    msg = f"🏃‍♂️ *Workout Synced!*\n\nActivity: {workout_type}\nDistance: {distance}\nDuration: {duration}"
-    
-    if TELEGRAM_CHAT_ID:
-        send_telegram_msg(TELEGRAM_CHAT_ID, msg)
-        
-    return {"status": "success"}
-
-# 3. Webhook for Telegram Chat Messages
 @app.post("/webhook/telegram")
 async def handle_telegram_chat(request: Request):
     data = await request.json()
-    
     message = data.get("message", {})
     chat_id = message.get("chat", {}).get("id")
     user_text = message.get("text", "")
     
     if chat_id and user_text:
-        reply = f"🤖 AI Coach Received: '{user_text}'"
-        send_telegram_msg(chat_id, reply)
+        # Get response from the AI model
+        ai_reply = generate_ai_response(user_text)
+        send_telegram_msg(chat_id, ai_reply)
         
     return {"status": "ok"}
