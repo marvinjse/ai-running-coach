@@ -1,7 +1,7 @@
 from fastapi import FastAPI, Form, Request
 from fastapi.responses import Response
 from twilio.twiml.messaging_response import MessagingResponse
-import google.generativeai as genai
+from google import genai
 import os
 
 app = FastAPI(title="Interactive AI Running Coach")
@@ -9,9 +9,16 @@ app = FastAPI(title="Interactive AI Running Coach")
 # --- CONTEXT MEMORY ---
 latest_run_context = "No recent runs logged."
 
-# Initialize Gemini Client using an environment variable
-genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
-model = genai.GenerativeModel('gemini-1.5-flash')
+# Initialize the NEW Gemini Client using an environment variable
+# The client automatically picks up the GEMINI_API_KEY environment variable!
+client = genai.Client()
+
+# ==========================================
+# NEW: FIX FOR THE 404 ERROR
+# ==========================================
+@app.get("/")
+async def root():
+    return {"message": "🏃 AI Running Coach Server is LIVE!"}
 
 # ==========================================
 # 1. RECEIVE AUTOMATIC APPLE WATCH RUNS
@@ -27,6 +34,8 @@ async def receive_health_data(request: Request):
         duration_mins = round(workout.get("duration", 0) / 60.0, 1)
         
         latest_run_context = f"User just completed {distance_miles} miles in {duration_mins} minutes."
+        
+        print("Run logged successfully!")
         return {"status": "success"}
     except Exception as e:
         return {"status": "error", "message": str(e)}
@@ -37,6 +46,7 @@ async def receive_health_data(request: Request):
 @app.post("/webhook/whatsapp")
 async def whatsapp_reply(Body: str = Form(...)):
     user_message = Body
+    print(f"Received WhatsApp message: {user_message}")
 
     system_prompt = f"""
     You are an expert running coach. 
@@ -45,11 +55,15 @@ async def whatsapp_reply(Body: str = Form(...)):
     Answer their questions concisely and supportively.
     """
 
-    # Ask Gemini for advice
+    # Ask Gemini for advice using the new SDK format
     full_prompt = f"{system_prompt}\n\nUser asks: {user_message}"
-    ai_response = model.generate_content(full_prompt)
     
-    coach_reply_text = ai_response.text
+    response = client.models.generate_content(
+        model="gemini-2.0-flash",
+        contents=full_prompt
+    )
+    
+    coach_reply_text = response.text
 
     # Format the response for Twilio
     twiml_response = MessagingResponse()
