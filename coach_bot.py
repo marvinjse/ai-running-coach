@@ -38,19 +38,21 @@ async def receive_health_data(request: Request):
 @app.post("/webhook/telegram")
 async def handle_telegram_chat(request: Request):
     data = await request.json()
+    print("Received Telegram Payload:", data)  # Inspect incoming structure
     
-    # Parse incoming Telegram message
     message = data.get("message", {})
     chat_id = message.get("chat", {}).get("id")
     user_text = message.get("text", "")
     
     if chat_id and user_text:
-        # Simple test response (Replace this logic with your AI/LLM call)
-        if user_text.lower() == "/start":
-            reply = "Hello! I am your AI Running Coach. Send me a message or sync a workout to get started!"
-        else:
-            reply = f"🤖 AI Coach Received: '{user_text}'\n\n(Connect your AI logic here to answer questions based on your logged workouts!)"
-            
-        send_telegram_msg(chat_id, reply)
+        reply = f"🤖 AI Coach Received: '{user_text}'"
+        
+        # Send response back and capture status
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        payload = {"chat_id": chat_id, "text": reply}
+        res = requests.post(url, json=payload)
+        
+        print(f"Telegram API Status Code: {res.status_code}")
+        print(f"Telegram API Response: {res.text}")
         
     return {"status": "ok"}
