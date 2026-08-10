@@ -2,4 +2,4 @@ fastapi
 uvicorn
 twilio
 python-multipart
-openai
+anthropic
