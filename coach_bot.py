@@ -1,7 +1,7 @@
 from fastapi import FastAPI, Form, Request
 from fastapi.responses import Response
 from twilio.twiml.messaging_response import MessagingResponse
-import anthropic
+import google.generativeai as genai
 import os
 
 app = FastAPI(title="Interactive AI Running Coach")
@@ -9,9 +9,9 @@ app = FastAPI(title="Interactive AI Running Coach")
 # --- CONTEXT MEMORY ---
 latest_run_context = "No recent runs logged."
 
-# Initialize Claude Client using an environment variable
-# Make sure to set ANTHROPIC_API_KEY in Render!
-client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
+# Initialize Gemini Client using an environment variable
+genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
+model = genai.GenerativeModel('gemini-1.5-flash')
 
 # ==========================================
 # 1. RECEIVE AUTOMATIC APPLE WATCH RUNS
@@ -27,8 +27,6 @@ async def receive_health_data(request: Request):
         duration_mins = round(workout.get("duration", 0) / 60.0, 1)
         
         latest_run_context = f"User just completed {distance_miles} miles in {duration_mins} minutes."
-        
-        print("Run logged successfully!")
         return {"status": "success"}
     except Exception as e:
         return {"status": "error", "message": str(e)}
@@ -39,7 +37,6 @@ async def receive_health_data(request: Request):
 @app.post("/webhook/whatsapp")
 async def whatsapp_reply(Body: str = Form(...)):
     user_message = Body
-    print(f"Received WhatsApp message: {user_message}")
 
     system_prompt = f"""
     You are an expert running coach. 
@@ -48,18 +45,11 @@ async def whatsapp_reply(Body: str = Form(...)):
     Answer their questions concisely and supportively.
     """
 
-    # Ask Claude for advice (Using Claude 3.5 Sonnet)
-    ai_response = client.messages.create(
-        model="claude-3-5-sonnet-20240620",
-        max_tokens=300,
-        temperature=0.7,
-        system=system_prompt,
-        messages=[
-            {"role": "user", "content": user_message}
-        ]
-    )
+    # Ask Gemini for advice
+    full_prompt = f"{system_prompt}\n\nUser asks: {user_message}"
+    ai_response = model.generate_content(full_prompt)
     
-    coach_reply_text = ai_response.content[0].text
+    coach_reply_text = ai_response.text
 
     # Format the response for Twilio
     twiml_response = MessagingResponse()
