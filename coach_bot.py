@@ -32,33 +32,31 @@ async def receive_health_data(request: Request):
     data = await request.json()
     print("Received raw payload:", data)
     
-    # Extract nested fields from HealthMirror schema
     val = data.get("value", {})
     workout_type = val.get("workoutType", data.get("name", "Workout")).replace("_", " ").title()
     
-    # Calculate duration in minutes
     duration_s = val.get("duration_s", 0)
     duration_min = round(duration_s / 60, 1) if duration_s else "N/A"
-    
-    # Energy / Calories
     calories = round(val.get("totalEnergy_kcal", 0), 1)
-    
-    # Date & Device
     date = data.get("localDate", "N/A")
-    device = data.get("source", "Apple Watch")
+    
+    # Clean non-breaking spaces from source name
+    device = str(data.get("source", "Apple Watch")).replace('\xa0', ' ')
     
     msg = (
-        f"🏋️‍♂️ *New Activity Logged!*\n\n"
-        f"• *Type:* {workout_type}\n"
-        f"• *Date:* {date}\n"
-        f"• *Duration:* {duration_min} mins\n"
-        f"• *Calories:* {calories} kcal\n"
-        f"• *Source:* {device}\n\n"
+        f"🏋️‍♂️ New Activity Logged!\n\n"
+        f"• Type: {workout_type}\n"
+        f"• Date: {date}\n"
+        f"• Duration: {duration_min} mins\n"
+        f"• Calories: {calories} kcal\n"
+        f"• Source: {device}\n\n"
         f"Great effort on your session!"
     )
     
     if TELEGRAM_CHAT_ID:
         send_telegram_msg(TELEGRAM_CHAT_ID, msg)
+        
+    return {"status": "success"}
         
     return {"status": "success"}
 
