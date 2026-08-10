@@ -57,7 +57,7 @@ async def telegram_reply(request: Request):
         # 1. Ask Gemini for advice
         full_prompt = f"{system_prompt}\n\nUser asks: {user_message}"
         ai_response = genai_client.models.generate_content(
-            model="gemini-2.5-flash",
+            model="gemini-3.6-flash",
             contents=full_prompt
         )
         
