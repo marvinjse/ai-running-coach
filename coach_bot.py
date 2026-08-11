@@ -199,10 +199,18 @@ def get_recent_chat_history(chat_id: str, limit=25):
 
 def send_daily_reminder():
     target_chat = TELEGRAM_CHAT_ID or "8682930690"
-    athlete_profile = get_athlete_profile(target_chat)
     training_plan = get_weekly_training_plan(target_chat)
-    past_runs = get_recent_workouts(limit=3)
-    today_day = datetime.now().strftime("%a")
+    today_day = datetime.now().strftime("%a")  # e.g., 'Mon', 'Tue'
+
+    # Find today's plan item
+    today_plan = next((item for item in training_plan if item.get("day_of_week") == today_day), None)
+
+    # Optional: Skip sending if today is marked as a 'Rest' day
+    if today_plan and today_plan.get("workout_type") == "Rest":
+        print(f"Skipping daily reminder: Today ({today_day}) is a rest day.")
+        return
+
+    # Otherwise, generate and send the reminder as usual...
 
     prompt = f"""
     You are an AI Running Coach sending a short, motivating morning reminder (2-3 sentences) to your athlete on Telegram.
