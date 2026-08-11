@@ -223,7 +223,7 @@ def check_and_update_dynamic_data(chat_id: str, user_text: str):
 
     try:
         response = ai.models.generate_content(
-            model="gemini-2.0-flash", contents=extraction_prompt
+            model="gemini-2.5-flash-lite", contents=extraction_prompt
         )
 
         raw_text = response.text.strip()
@@ -362,7 +362,7 @@ def send_daily_reminder():
     """
     try:
         response = ai.models.generate_content(
-            model="gemini-2.0-flash", contents=prompt
+            model="gemini-2.5-flash-lite", contents=prompt
         )
         send_telegram_msg(target_chat, response.text)
     except Exception as e:
@@ -413,7 +413,7 @@ def send_weekly_recap():
     """
     try:
         response = ai.models.generate_content(
-            model="gemini-2.0-flash", contents=prompt
+            model="gemini-2.5-flash-lite", contents=prompt
         )
         send_telegram_msg(target_chat, response.text)
     except Exception as e:
@@ -486,7 +486,7 @@ async def receive_health_data(request: Request):
 
     try:
         response = ai.models.generate_content(
-            model="gemini-2.0-flash", contents=prompt
+            model="gemini-2.5-flash-lite", contents=prompt
         )
         reply = response.text
     except Exception as e:
@@ -558,7 +558,7 @@ async def handle_telegram_chat(request: Request):
         try:
             # Updated to actively supported model identifier
             response = ai.models.generate_content(
-                model="gemini-2.0-flash", contents=prompt
+                model="gemini-2.5-flash-lite", contents=prompt
             )
 
             raw_text = response.text.strip()
