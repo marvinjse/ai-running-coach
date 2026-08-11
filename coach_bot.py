@@ -24,11 +24,13 @@ db: Client = (
     else None
 )
 
-# Background Scheduler for Reminders & Recaps (PST)
+# Model String
+MODEL_NAME = "gemini-3.6-flash"
+
 scheduler = BackgroundScheduler(timezone="America/Los_Angeles")
 
 
-# --- UNIT CONVERSION HELPERS ---
+# --- HELPER FUNCTIONS ---
 
 
 def km_to_miles(km_val):
@@ -51,7 +53,6 @@ def send_telegram_msg(chat_id: str, text: str):
     if not TELEGRAM_BOT_TOKEN:
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-
     res = requests.post(
         url, json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
     )
@@ -65,10 +66,8 @@ def send_telegram_msg(chat_id: str, text: str):
 def save_workout_to_db(payload: dict):
     if not db:
         return
-
     val = payload.get("value", {})
     uuid = payload.get("uuid") or f"run_{payload.get('start')}"
-
     record = {
         "uuid": uuid,
         "local_date": payload.get("localDate"),
@@ -81,7 +80,6 @@ def save_workout_to_db(payload: dict):
         "active_calories": val.get("activeEnergy_kcal"),
         "raw_payload": payload,
     }
-
     try:
         db.table("workouts").upsert(record, on_conflict="uuid").execute()
     except Exception as e:
@@ -100,12 +98,10 @@ def get_recent_workouts(limit=5):
             .execute()
         )
         data = res.data or []
-
         formatted_runs = []
         for r in data:
             d_km = float(r.get("distance_km") or 0)
             d_min = float(r.get("duration_min") or 0)
-
             formatted_runs.append(
                 {
                     "date": r.get("local_date"),
@@ -148,7 +144,6 @@ ATHLETE DYNAMIC PROFILE & GOALS:
 """
     except Exception as e:
         print(f"Error fetching profile: {e}")
-
     return "Unit Preference: Imperial (miles, min/mi)"
 
 
@@ -166,138 +161,6 @@ def get_weekly_training_plan(chat_id: str):
     except Exception as e:
         print(f"Error fetching training plan: {e}")
         return []
-
-
-def check_and_update_dynamic_data(chat_id: str, user_text: str):
-    """Parses user message and explicitly updates athlete_profile and training_plans in Supabase."""
-    if not db or not user_text:
-        return
-
-    keywords = [
-        "goal",
-        "target",
-        "race",
-        "schedule",
-        "marathon",
-        "half",
-        "plan",
-        "mon",
-        "tue",
-        "wed",
-        "thu",
-        "fri",
-        "sat",
-        "sun",
-        "mile",
-        "run",
-    ]
-    if not any(kw in user_text.lower() for kw in keywords):
-        return
-
-    extraction_prompt = f"""
-    You are a data extraction assistant. Analyze this runner's message to their coach:
-    "{user_text}"
-
-    If they mention changing a workout, distance, or activity for any day of the week, extract a "plan_update".
-    If they mention changing their primary race goal, target date, or target time, extract a "profile_update".
-
-    Output STRICT JSON matching this schema:
-    {{
-      "plan_update": [
-        {{
-          "day_of_week": "Sat",
-          "target_distance_miles": 5.0,
-          "workout_type": "Long Run"
-        }}
-      ],
-      "profile_update": {{
-        "primary_goal": "optional string",
-        "target_time": "optional string"
-      }}
-    }}
-
-    Rules for day_of_week: Use 3-letter abbreviation ('Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun').
-    If no updates are made, output: {{}}
-    Return ONLY raw valid JSON without markdown fences or extra prose.
-    """
-
-    try:
-        response = ai.models.generate_content(
-            model="gemini-2.5-flash-lite", contents=extraction_prompt
-        )
-
-        raw_text = response.text.strip()
-        if "```" in raw_text:
-            raw_text = (
-                raw_text.split("```")[1]
-                .replace("json", "")
-                .replace("```", "")
-                .strip()
-            )
-
-        data = json.loads(raw_text)
-        print(f"🔍 Extracted intent data: {data}")
-
-        # Update Training Plan
-        plan_updates = data.get("plan_update", [])
-        if isinstance(plan_updates, list) and len(plan_updates) > 0:
-            for item in plan_updates:
-                day = item.get("day_of_week")
-                if day:
-                    day_abbr = day[:3].capitalize()
-
-                    # Fetch existing record to merge fields
-                    existing = (
-                        db.table("training_plans")
-                        .select("*")
-                        .eq("chat_id", str(chat_id))
-                        .eq("day_of_week", day_abbr)
-                        .execute()
-                    )
-
-                    record = {
-                        "chat_id": str(chat_id),
-                        "day_of_week": day_abbr,
-                        "workout_type": item.get("workout_type")
-                        or (
-                            existing.data[0]["workout_type"]
-                            if existing.data
-                            else "Long Run"
-                        ),
-                        "target_distance_miles": item.get(
-                            "target_distance_miles"
-                        )
-                        or (
-                            existing.data[0]["target_distance_miles"]
-                            if existing.data
-                            else 0
-                        ),
-                        "updated_at": datetime.now().isoformat(),
-                    }
-
-                    db.table("training_plans").upsert(
-                        record, on_conflict="chat_id,day_of_week"
-                    ).execute()
-                    print(
-                        f"✅ Supabase training_plans updated successfully for {day_abbr}!"
-                    )
-
-        # Update Athlete Profile
-        prof_update = data.get("profile_update")
-        if (
-            prof_update
-            and isinstance(prof_update, dict)
-            and any(prof_update.values())
-        ):
-            prof_update["chat_id"] = str(chat_id)
-            prof_update["updated_at"] = datetime.now().isoformat()
-            db.table("athlete_profile").upsert(
-                prof_update, on_conflict="chat_id"
-            ).execute()
-            print("✅ Supabase athlete_profile updated successfully!")
-
-    except Exception as e:
-        print(f"❌ Error during dynamic update extraction: {e}")
 
 
 def save_chat_turn(chat_id: str, sender: str, text: str):
@@ -325,14 +188,13 @@ def get_recent_chat_history(chat_id: str, limit=25):
         )
         turns = res.data or []
         turns.reverse()
-        formatted = [f"{t['sender'].upper()}: {t['message']}" for t in turns]
-        return "\n".join(formatted)
+        return "\n".join([f"{t['sender'].upper()}: {t['message']}" for t in turns])
     except Exception as e:
         print(f"Chat history fetch error: {e}")
         return ""
 
 
-# --- AUTOMATED SCHEDULER JOBS ---
+# --- SCHEDULER JOBS ---
 
 
 def send_daily_reminder():
@@ -340,7 +202,6 @@ def send_daily_reminder():
     athlete_profile = get_athlete_profile(target_chat)
     training_plan = get_weekly_training_plan(target_chat)
     past_runs = get_recent_workouts(limit=3)
-
     today_day = datetime.now().strftime("%a")
 
     prompt = f"""
@@ -358,12 +219,10 @@ def send_daily_reminder():
     {json.dumps(past_runs, indent=2)}
     ```
 
-    Today is {today_day}. Remind them of today's target workout according to the training plan. Keep it energetic and focused!
+    Today is {today_day}. Remind them of today's target workout according to the plan. Keep it energetic!
     """
     try:
-        response = ai.models.generate_content(
-            model="gemini-2.5-flash-lite", contents=prompt
-        )
+        response = ai.models.generate_content(model=MODEL_NAME, contents=prompt)
         send_telegram_msg(target_chat, response.text)
     except Exception as e:
         print(f"Error sending daily reminder: {e}")
@@ -373,7 +232,6 @@ def send_weekly_recap():
     target_chat = TELEGRAM_CHAT_ID or "8682930690"
     if not db:
         return
-
     seven_days_ago = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
     athlete_profile = get_athlete_profile(target_chat)
     training_plan = get_weekly_training_plan(target_chat)
@@ -407,24 +265,19 @@ def send_weekly_recap():
 
     Format using Markdown:
     1. 📊 **Weekly Totals:** Planned vs. Actual Distance (miles).
-    2. 🏃 **Pace & HR Analysis:** Evaluation of effort, heart rate control, and consistency.
-    3. 🎯 **Progress Toward Goal:** Progress evaluation toward their target race.
-    4. 💡 **Focus for Next Week:** Key action items for the upcoming week.
+    2. 🏃 **Pace & HR Analysis:** Evaluation of effort and heart rate.
+    3. 🎯 **Progress Toward Goal:** Progress toward target race.
+    4. 💡 **Focus for Next Week:** Key action items for upcoming week.
     """
     try:
-        response = ai.models.generate_content(
-            model="gemini-2.5-flash-lite", contents=prompt
-        )
+        response = ai.models.generate_content(model=MODEL_NAME, contents=prompt)
         send_telegram_msg(target_chat, response.text)
     except Exception as e:
         print(f"Error generating weekly recap: {e}")
 
 
-# Run daily at 7:30 AM PST & Sunday at 7:00 PM PST
 scheduler.add_job(send_daily_reminder, "cron", hour=7, minute=30)
-scheduler.add_job(
-    send_weekly_recap, "cron", day_of_week="sun", hour=19, minute=0
-)
+scheduler.add_job(send_weekly_recap, "cron", day_of_week="sun", hour=19, minute=0)
 
 
 @app.on_event("startup")
@@ -481,13 +334,11 @@ async def receive_health_data(request: Request):
     {json.dumps(past_runs, indent=2)}
     ```
 
-    Provide a concise, motivating workout summary for Telegram in Imperial units. Compare this effort against their planned target for this day of the week.
+    Provide a concise workout summary for Telegram in Imperial units. Compare this effort against their planned target for today.
     """
 
     try:
-        response = ai.models.generate_content(
-            model="gemini-2.5-flash-lite", contents=prompt
-        )
+        response = ai.models.generate_content(model=MODEL_NAME, contents=prompt)
         reply = response.text
     except Exception as e:
         reply = f"Workout saved, but error generating AI analysis: {e}"
@@ -519,14 +370,10 @@ async def handle_telegram_chat(request: Request):
         {athlete_profile}
 
         Stored Weekly Training Plan:
-        ```json
         {json.dumps(training_plan, indent=2)}
-        ```
 
         Recent Workout History (Imperial):
-        ```json
         {json.dumps(past_runs, indent=2)}
-        ```
 
         Recent Chat History:
         {chat_context}
@@ -535,7 +382,7 @@ async def handle_telegram_chat(request: Request):
 
         INSTRUCTIONS:
         1. Answer their message directly as a supportive coach in "reply_text".
-        2. IF they mentioned changing a race goal or weekly schedule (e.g. "Saturday run is 5 miles"), extract those updates under "plan_update" or "profile_update".
+        2. IF they mentioned changing a race goal or weekly schedule (e.g., "Saturday run is 5 miles"), extract those updates under "plan_update" or "profile_update".
 
         Output STRICT JSON matching this format:
         {{
@@ -552,28 +399,20 @@ async def handle_telegram_chat(request: Request):
             "target_time": "optional string"
           }}
         }}
-        Return ONLY valid raw JSON.
         """
 
         try:
-            # Updated to actively supported model identifier
+            # Force structured JSON mode to prevent parsing exceptions
             response = ai.models.generate_content(
-                model="gemini-2.5-flash-lite", contents=prompt
+                model=MODEL_NAME,
+                contents=prompt,
+                config={"response_mime_type": "application/json"},
             )
 
-            raw_text = response.text.strip()
-            if "```" in raw_text:
-                raw_text = (
-                    raw_text.split("```")[1]
-                    .replace("json", "")
-                    .replace("```", "")
-                    .strip()
-                )
-
-            parsed = json.loads(raw_text)
+            parsed = json.loads(response.text)
             reply = parsed.get("reply_text", "Got it!")
 
-            # Apply Plan Updates to Supabase
+            # Update Training Plan in Supabase
             plan_updates = parsed.get("plan_update", [])
             if isinstance(plan_updates, list) and len(plan_updates) > 0:
                 for item in plan_updates:
@@ -583,9 +422,7 @@ async def handle_telegram_chat(request: Request):
                         record = {
                             "chat_id": str(chat_id),
                             "day_of_week": day_abbr,
-                            "workout_type": item.get(
-                                "workout_type", "Long Run"
-                            ),
+                            "workout_type": item.get("workout_type", "Long Run"),
                             "target_distance_miles": item.get(
                                 "target_distance_miles", 0
                             ),
@@ -598,7 +435,7 @@ async def handle_telegram_chat(request: Request):
                             f"✅ Supabase training_plans updated for {day_abbr}: {record}"
                         )
 
-            # Apply Profile Updates to Supabase
+            # Update Athlete Profile in Supabase
             prof_update = parsed.get("profile_update")
             if (
                 prof_update
@@ -614,7 +451,7 @@ async def handle_telegram_chat(request: Request):
 
         except Exception as e:
             print(f"❌ Error during AI processing: {e}")
-            reply = "I've noted that! Let's keep training hard for your race."
+            reply = "I've noted that! Let's keep working toward your race."
 
         save_chat_turn(chat_id, "coach", reply)
         send_telegram_msg(chat_id, reply)
