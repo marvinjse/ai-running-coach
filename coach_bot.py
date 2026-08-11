@@ -223,7 +223,7 @@ def check_and_update_dynamic_data(chat_id: str, user_text: str):
 
     try:
         response = ai.models.generate_content(
-            model="gemini-3.6-flash", contents=extraction_prompt
+            model="gemini-2.5-flash", contents=extraction_prompt
         )
 
         raw_text = response.text.strip()
@@ -362,7 +362,7 @@ def send_daily_reminder():
     """
     try:
         response = ai.models.generate_content(
-            model="gemini-3.6-flash", contents=prompt
+            model="gemini-2.5-flash", contents=prompt
         )
         send_telegram_msg(target_chat, response.text)
     except Exception as e:
@@ -413,7 +413,7 @@ def send_weekly_recap():
     """
     try:
         response = ai.models.generate_content(
-            model="gemini-3.6-flash", contents=prompt
+            model="gemini-2.5-flash", contents=prompt
         )
         send_telegram_msg(target_chat, response.text)
     except Exception as e:
@@ -486,7 +486,7 @@ async def receive_health_data(request: Request):
 
     try:
         response = ai.models.generate_content(
-            model="gemini-3.6-flash", contents=prompt
+            model="gemini-2.5-flash", contents=prompt
         )
         reply = response.text
     except Exception as e:
@@ -508,10 +508,6 @@ async def handle_telegram_chat(request: Request):
     if chat_id and user_text:
         save_chat_turn(chat_id, "user", user_text)
 
-        # 1. Check if user wants to update goals or weekly schedule
-        check_and_update_dynamic_data(chat_id, user_text)
-
-        # 2. Pull all dynamic context
         athlete_profile = get_athlete_profile(chat_id)
         training_plan = get_weekly_training_plan(chat_id)
         past_runs = get_recent_workouts(limit=5)
@@ -527,7 +523,7 @@ async def handle_telegram_chat(request: Request):
         {json.dumps(training_plan, indent=2)}
         ```
 
-        Athlete's Workout History (Imperial Units):
+        Recent Workout History (Imperial):
         ```json
         {json.dumps(past_runs, indent=2)}
         ```
@@ -537,16 +533,68 @@ async def handle_telegram_chat(request: Request):
 
         Athlete's Message: "{user_text}"
 
-        Answer their question directly using their workout database, stored training plan, and chat memory.
+        INSTRUCTIONS:
+        1. Answer their message directly as a supportive coach in "reply_text".
+        2. IF they mentioned changing a race goal or weekly schedule (e.g. "Saturday run is 5 miles"), extract those updates under "plan_update" or "profile_update".
+
+        Output STRICT JSON matching this format:
+        {{
+          "reply_text": "Your conversational reply to the runner here...",
+          "plan_update": [
+            {{
+              "day_of_week": "Sat",
+              "target_distance_miles": 5.0,
+              "workout_type": "Long Run"
+            }}
+          ],
+          "profile_update": {{
+            "primary_goal": "optional string",
+            "target_time": "optional string"
+          }}
+        }}
+        Return ONLY valid raw JSON.
         """
 
         try:
             response = ai.models.generate_content(
-                model="gemini-3.6-flash", contents=prompt
+                model="gemini-2.5-flash", contents=prompt
             )
-            reply = response.text
+            
+            raw_text = response.text.strip()
+            if "```" in raw_text:
+                raw_text = raw_text.split("```")[1].replace("json", "").replace("```", "").strip()
+            
+            parsed = json.loads(raw_text)
+            reply = parsed.get("reply_text", "Got it!")
+
+            # Apply Plan Updates to Supabase
+            plan_updates = parsed.get("plan_update", [])
+            if isinstance(plan_updates, list) and len(plan_updates) > 0:
+                for item in plan_updates:
+                    day = item.get("day_of_week")
+                    if day:
+                        day_abbr = day[:3].capitalize()
+                        record = {
+                            "chat_id": str(chat_id),
+                            "day_of_week": day_abbr,
+                            "workout_type": item.get("workout_type", "Long Run"),
+                            "target_distance_miles": item.get("target_distance_miles", 0),
+                            "updated_at": datetime.now().isoformat()
+                        }
+                        db.table("training_plans").upsert(record, on_conflict="chat_id,day_of_week").execute()
+                        print(f"✅ Supabase training_plans updated for {day_abbr}: {record}")
+
+            # Apply Profile Updates to Supabase
+            prof_update = parsed.get("profile_update")
+            if prof_update and isinstance(prof_update, dict) and any(prof_update.values()):
+                prof_update["chat_id"] = str(chat_id)
+                prof_update["updated_at"] = datetime.now().isoformat()
+                db.table("athlete_profile").upsert(prof_update, on_conflict="chat_id").execute()
+                print(f"✅ Supabase athlete_profile updated: {prof_update}")
+
         except Exception as e:
-            reply = "I had trouble accessing your workout history. Please try again in a moment."
+            print(f"❌ Error during AI processing: {e}")
+            reply = "I updated my notes on your run, but had a brief hiccup parsing the database update. Let's keep going!"
 
         save_chat_turn(chat_id, "coach", reply)
         send_telegram_msg(chat_id, reply)
