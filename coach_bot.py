@@ -1,5 +1,7 @@
 import json
 import os
+from datetime import datetime, timedelta
+from apscheduler.schedulers.background import BackgroundScheduler
 from fastapi import FastAPI, Request
 from google import genai
 import requests
@@ -22,16 +24,20 @@ db: Client = (
     else None
 )
 
+# Background Scheduler for Reminders & Recaps (PST)
+scheduler = BackgroundScheduler(timezone="America/Los_Angeles")
+
+
+# --- UNIT CONVERSION HELPERS ---
+
 
 def km_to_miles(km_val):
-    """Helper to convert kilometers to miles."""
     if km_val is None:
         return None
     return round(float(km_val) * 0.621371, 2)
 
 
 def pace_km_to_miles(dist_km, dur_min):
-    """Calculates pace in min/mile given distance in km and duration in minutes."""
     if not dist_km or not dur_min or dist_km == 0:
         return None
     dist_mi = dist_km * 0.621371
@@ -42,7 +48,6 @@ def pace_km_to_miles(dist_km, dur_min):
 
 
 def send_telegram_msg(chat_id: str, text: str):
-    """Sends Telegram message with markdown fallback."""
     if not TELEGRAM_BOT_TOKEN:
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -54,27 +59,21 @@ def send_telegram_msg(chat_id: str, text: str):
         requests.post(url, json={"chat_id": chat_id, "text": text})
 
 
+# --- DATABASE FUNCTIONS ---
+
+
 def save_workout_to_db(payload: dict):
-    """Inserts or updates workout in Supabase PostgreSQL database."""
     if not db:
         return
 
     val = payload.get("value", {})
     uuid = payload.get("uuid") or f"run_{payload.get('start')}"
 
-    # Extract raw metric units
-    dist_km = val.get("distance_km")
-    dur_min = val.get("duration_min")
-
-    # Convert to Imperial
-    dist_mi = km_to_miles(dist_km)
-    pace_mi = pace_km_to_miles(dist_km, dur_min)
-
     record = {
         "uuid": uuid,
         "local_date": payload.get("localDate"),
-        "distance_km": dist_km,
-        "duration_min": dur_min,
+        "distance_km": val.get("distance_km"),
+        "duration_min": val.get("duration_min"),
         "avg_pace": val.get("avgPace"),
         "avg_hr": val.get("avgHeartRate_bpm"),
         "max_hr": val.get("maxHeartRate_bpm"),
@@ -90,7 +89,6 @@ def save_workout_to_db(payload: dict):
 
 
 def get_recent_workouts(limit=5):
-    """Fetches the last N workouts from Supabase and formats in Imperial units."""
     if not db:
         return []
     try:
@@ -107,15 +105,14 @@ def get_recent_workouts(limit=5):
         for r in data:
             d_km = float(r.get("distance_km") or 0)
             d_min = float(r.get("duration_min") or 0)
-            d_mi = km_to_miles(d_km)
-            p_mi = pace_km_to_miles(d_km, d_min)
 
             formatted_runs.append(
                 {
                     "date": r.get("local_date"),
-                    "distance_miles": d_mi,
+                    "distance_miles": km_to_miles(d_km),
                     "duration_min": d_min,
-                    "avg_pace_per_mile": p_mi or r.get("avg_pace"),
+                    "avg_pace_per_mile": pace_km_to_miles(d_km, d_min)
+                    or r.get("avg_pace"),
                     "avg_hr_bpm": r.get("avg_hr"),
                     "max_hr_bpm": r.get("max_hr"),
                     "avg_cadence_spm": r.get("avg_cadence"),
@@ -124,12 +121,141 @@ def get_recent_workouts(limit=5):
             )
         return formatted_runs
     except Exception as e:
-        print(f"Supabase fetch error: {e}")
+        print(f"Supabase workout fetch error: {e}")
         return []
 
 
+def get_athlete_profile(chat_id: str):
+    if not db:
+        return "Unit Preference: Imperial (miles, min/mi)"
+    try:
+        res = (
+            db.table("athlete_profile")
+            .select("*")
+            .eq("chat_id", str(chat_id))
+            .execute()
+        )
+        data = res.data
+        if data:
+            p = data[0]
+            return f"""
+ATHLETE DYNAMIC PROFILE & GOALS:
+- Primary Goal: {p.get('primary_goal', 'General Fitness')}
+- Target Date: {p.get('target_date', 'N/A')}
+- Target Time/Pace: {p.get('target_time', 'N/A')}
+- Weekly Schedule Constraints: {p.get('schedule_constraints', 'Flexible')}
+- Unit Preference: {p.get('unit_preference', 'Imperial (miles, min/mi)')}
+"""
+    except Exception as e:
+        print(f"Error fetching profile: {e}")
+
+    return "Unit Preference: Imperial (miles, min/mi)"
+
+
+def get_weekly_training_plan(chat_id: str):
+    if not db:
+        return []
+    try:
+        res = (
+            db.table("training_plans")
+            .select("*")
+            .eq("chat_id", str(chat_id))
+            .execute()
+        )
+        return res.data or []
+    except Exception as e:
+        print(f"Error fetching training plan: {e}")
+        return []
+
+
+def check_and_update_dynamic_data(chat_id: str, user_text: str):
+    """Uses Gemini to detect if user wants to update their profile or weekly schedule."""
+    if not db or not user_text:
+        return
+
+    keywords = [
+        "goal",
+        "target",
+        "race",
+        "schedule",
+        "marathon",
+        "plan",
+        "monday",
+        "tuesday",
+        "wednesday",
+        "thursday",
+        "friday",
+        "saturday",
+        "sunday",
+        "miles",
+    ]
+    if not any(kw in user_text.lower() for kw in keywords):
+        return
+
+    extraction_prompt = f"""
+    Analyze this message from a runner:
+    "{user_text}"
+
+    If they are updating their general goals (race, target date, constraints), return JSON under "profile_update".
+    If they are updating a specific day's workout in their training plan, return JSON under "plan_update".
+
+    Expected JSON Format:
+    {{
+        "profile_update": {{
+            "primary_goal": "string or omit",
+            "target_date": "YYYY-MM-DD or omit",
+            "target_time": "string or omit",
+            "schedule_constraints": "string or omit"
+        }},
+        "plan_update": [
+            {{
+                "day_of_week": "Mon/Tue/Wed/Thu/Fri/Sat/Sun",
+                "workout_type": "Easy Run/Tempo/Long Run/Strength/Rest",
+                "target_distance_miles": number,
+                "target_pace_per_mile": "string",
+                "notes": "string"
+            }}
+        ]
+    }}
+
+    If no updates are present, return strictly: {{}}
+    Return ONLY valid JSON.
+    """
+    try:
+        response = ai.models.generate_content(
+            model="gemini-3.6-flash", contents=extraction_prompt
+        )
+        cleaned_text = (
+            response.text.strip()
+            .removeprefix("```json")
+            .removeprefix("```")
+            .removesuffix("```")
+            .strip()
+        )
+        data = json.loads(cleaned_text)
+
+        prof = data.get("profile_update")
+        if prof and isinstance(prof, dict) and any(prof.values()):
+            prof["chat_id"] = str(chat_id)
+            prof["updated_at"] = datetime.now().isoformat()
+            db.table("athlete_profile").upsert(
+                prof, on_conflict="chat_id"
+            ).execute()
+
+        plan = data.get("plan_update")
+        if plan and isinstance(plan, list):
+            for item in plan:
+                item["chat_id"] = str(chat_id)
+                item["updated_at"] = datetime.now().isoformat()
+                db.table("training_plans").upsert(
+                    item, on_conflict="chat_id,day_of_week"
+                ).execute()
+
+    except Exception as e:
+        print(f"Dynamic extraction error: {e}")
+
+
 def save_chat_turn(chat_id: str, sender: str, text: str):
-    """Stores a message turn in conversation memory."""
     if not db:
         return
     try:
@@ -140,8 +266,7 @@ def save_chat_turn(chat_id: str, sender: str, text: str):
         print(f"Chat save error: {e}")
 
 
-def get_recent_chat_history(chat_id: str, limit=6):
-    """Fetches recent conversation exchanges for context."""
+def get_recent_chat_history(chat_id: str, limit=25):
     if not db:
         return ""
     try:
@@ -162,54 +287,156 @@ def get_recent_chat_history(chat_id: str, limit=6):
         return ""
 
 
-@app.post("/webhook/apple-health")
-@app.post("/webhook/apple-health/")
-async def receive_health_data(request: Request):
-    payload = await request.json()
+# --- AUTOMATED SCHEDULER JOBS ---
 
-    # 1. Save permanently to PostgreSQL
-    save_workout_to_db(payload)
 
-    # 2. Extract and convert latest run metrics to Imperial
-    val = payload.get("value", {})
-    dist_km = val.get("distance_km")
-    dur_min = val.get("duration_min")
-    dist_mi = km_to_miles(dist_km)
-    pace_mi = pace_km_to_miles(dist_km, dur_min)
+def send_daily_reminder():
+    target_chat = TELEGRAM_CHAT_ID or "8682930690"
+    athlete_profile = get_athlete_profile(target_chat)
+    training_plan = get_weekly_training_plan(target_chat)
+    past_runs = get_recent_workouts(limit=3)
 
-    imperial_latest_summary = {
-        "date": payload.get("localDate"),
-        "distance_miles": dist_mi,
-        "duration_min": dur_min,
-        "avg_pace_per_mile": pace_mi,
-        "avg_hr_bpm": val.get("avgHeartRate_bpm"),
-        "max_hr_bpm": val.get("maxHeartRate_bpm"),
-        "avg_cadence_spm": val.get("avgCadence_spm"),
-        "active_calories": val.get("activeEnergy_kcal"),
-        "vo2_max": val.get("vo2Max_mL_kg_min"),
-    }
-
-    # 3. Fetch past runs for trend comparison
-    past_runs = get_recent_workouts(limit=5)
+    today_day = datetime.now().strftime("%a")
 
     prompt = f"""
-    You are an expert AI Running Coach communicating in IMPERIAL UNITS ONLY (miles, min/mile, bpm, SPM).
+    You are an AI Running Coach sending a short, motivating morning reminder (2-3 sentences) to your athlete on Telegram.
 
-    IMPORTANT UNIT INSTRUCTION:
-    - ALWAYS format distance in MILES (mi).
-    - ALWAYS format pace in MINUTES PER MILE (e.g., 8:15 /mi). Never use km or min/km.
+    {athlete_profile}
 
-    Latest Workout Metrics (Imperial):
+    Weekly Training Plan:
     ```json
-    {json.dumps(imperial_latest_summary, indent=2)}
+    {json.dumps(training_plan, indent=2)}
     ```
 
-    Recent Workout History (Imperial):
+    Recent Completed Workouts:
     ```json
     {json.dumps(past_runs, indent=2)}
     ```
 
-    Provide a concise, motivating workout summary for Telegram. Highlight pace in min/mile and distance in miles. Compare performance against recent trends.
+    Today is {today_day}. Remind them of today's target workout according to the training plan. Keep it energetic and focused!
+    """
+    try:
+        response = ai.models.generate_content(
+            model="gemini-3.6-flash", contents=prompt
+        )
+        send_telegram_msg(target_chat, response.text)
+    except Exception as e:
+        print(f"Error sending daily reminder: {e}")
+
+
+def send_weekly_recap():
+    target_chat = TELEGRAM_CHAT_ID or "8682930690"
+    if not db:
+        return
+
+    seven_days_ago = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
+    athlete_profile = get_athlete_profile(target_chat)
+    training_plan = get_weekly_training_plan(target_chat)
+
+    try:
+        res = (
+            db.table("workouts")
+            .select("*")
+            .gte("local_date", seven_days_ago)
+            .execute()
+        )
+        weekly_runs = res.data or []
+    except Exception as e:
+        print(f"Error fetching weekly runs: {e}")
+        return
+
+    prompt = f"""
+    You are an AI Running Coach generating a Weekly Training Recap for your athlete on Telegram.
+
+    {athlete_profile}
+
+    Planned Schedule:
+    ```json
+    {json.dumps(training_plan, indent=2)}
+    ```
+
+    Completed Workouts Past 7 Days:
+    ```json
+    {json.dumps(weekly_runs, indent=2)}
+    ```
+
+    Format using Markdown:
+    1. 📊 **Weekly Totals:** Planned vs. Actual Distance (miles).
+    2. 🏃 **Pace & HR Analysis:** Evaluation of effort, heart rate control, and consistency.
+    3. 🎯 **Progress Toward Goal:** Progress evaluation toward their target race.
+    4. 💡 **Focus for Next Week:** Key action items for the upcoming week.
+    """
+    try:
+        response = ai.models.generate_content(
+            model="gemini-3.6-flash", contents=prompt
+        )
+        send_telegram_msg(target_chat, response.text)
+    except Exception as e:
+        print(f"Error generating weekly recap: {e}")
+
+
+# Run daily at 7:30 AM PST & Sunday at 7:00 PM PST
+scheduler.add_job(send_daily_reminder, "cron", hour=7, minute=30)
+scheduler.add_job(
+    send_weekly_recap, "cron", day_of_week="sun", hour=19, minute=0
+)
+
+
+@app.on_event("startup")
+def start_scheduler():
+    scheduler.start()
+
+
+# --- WEBHOOK ENDPOINTS ---
+
+
+@app.post("/webhook/apple-health")
+@app.post("/webhook/apple-health/")
+async def receive_health_data(request: Request):
+    payload = await request.json()
+    save_workout_to_db(payload)
+
+    val = payload.get("value", {})
+    dist_km = val.get("distance_km")
+    dur_min = val.get("duration_min")
+
+    imperial_latest_summary = {
+        "date": payload.get("localDate"),
+        "distance_miles": km_to_miles(dist_km),
+        "duration_min": dur_min,
+        "avg_pace_per_mile": pace_km_to_miles(dist_km, dur_min),
+        "avg_hr_bpm": val.get("avgHeartRate_bpm"),
+        "max_hr_bpm": val.get("maxHeartRate_bpm"),
+        "avg_cadence_spm": val.get("avgCadence_spm"),
+        "active_calories": val.get("activeEnergy_kcal"),
+    }
+
+    target_chat = TELEGRAM_CHAT_ID or "8682930690"
+    athlete_profile = get_athlete_profile(target_chat)
+    training_plan = get_weekly_training_plan(target_chat)
+    past_runs = get_recent_workouts(limit=5)
+
+    prompt = f"""
+    You are an expert AI Running Coach.
+
+    {athlete_profile}
+
+    Weekly Planned Schedule:
+    ```json
+    {json.dumps(training_plan, indent=2)}
+    ```
+
+    Latest Logged Workout (Imperial):
+    ```json
+    {json.dumps(imperial_latest_summary, indent=2)}
+    ```
+
+    Recent Workout History:
+    ```json
+    {json.dumps(past_runs, indent=2)}
+    ```
+
+    Provide a concise, motivating workout summary for Telegram in Imperial units. Compare this effort against their planned target for this day of the week.
     """
 
     try:
@@ -220,7 +447,6 @@ async def receive_health_data(request: Request):
     except Exception as e:
         reply = f"Workout saved, but error generating AI analysis: {e}"
 
-    target_chat = TELEGRAM_CHAT_ID or "8682930690"
     save_chat_turn(target_chat, "coach", reply)
     send_telegram_msg(target_chat, reply)
     return {"status": "success"}
@@ -237,17 +463,26 @@ async def handle_telegram_chat(request: Request):
     if chat_id and user_text:
         save_chat_turn(chat_id, "user", user_text)
 
+        # 1. Check if user wants to update goals or weekly schedule
+        check_and_update_dynamic_data(chat_id, user_text)
+
+        # 2. Pull all dynamic context
+        athlete_profile = get_athlete_profile(chat_id)
+        training_plan = get_weekly_training_plan(chat_id)
         past_runs = get_recent_workouts(limit=5)
-        chat_context = get_recent_chat_history(chat_id, limit=6)
+        chat_context = get_recent_chat_history(chat_id, limit=25)
 
         prompt = f"""
         You are an AI Running Coach chatting with your athlete on Telegram.
 
-        IMPORTANT UNIT INSTRUCTION:
-        - Use IMPERIAL UNITS ONLY for all responses: Miles (mi), Minutes per Mile (min/mi), SPM, and BPM.
-        - NEVER reference kilometers or min/km.
+        {athlete_profile}
 
-        Athlete's Workout History Database (Imperial Units):
+        Stored Weekly Training Plan:
+        ```json
+        {json.dumps(training_plan, indent=2)}
+        ```
+
+        Athlete's Workout History (Imperial Units):
         ```json
         {json.dumps(past_runs, indent=2)}
         ```
@@ -255,9 +490,9 @@ async def handle_telegram_chat(request: Request):
         Recent Chat History:
         {chat_context}
 
-        Athlete's New Message: "{user_text}"
+        Athlete's Message: "{user_text}"
 
-        Answer their question directly using their workout database and conversation memory. If they ask about baselines, heart rate, or trends, evaluate the metrics in miles and min/mile. Keep replies concise and conversational.
+        Answer their question directly using their workout database, stored training plan, and chat memory.
         """
 
         try:
