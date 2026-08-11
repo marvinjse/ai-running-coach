@@ -223,7 +223,7 @@ def check_and_update_dynamic_data(chat_id: str, user_text: str):
 
     try:
         response = ai.models.generate_content(
-            model="gemini-2.5-flash", contents=extraction_prompt
+            model="gemini-2.0-flash", contents=extraction_prompt
         )
 
         raw_text = response.text.strip()
@@ -362,7 +362,7 @@ def send_daily_reminder():
     """
     try:
         response = ai.models.generate_content(
-            model="gemini-2.5-flash", contents=prompt
+            model="gemini-2.0-flash", contents=prompt
         )
         send_telegram_msg(target_chat, response.text)
     except Exception as e:
@@ -413,7 +413,7 @@ def send_weekly_recap():
     """
     try:
         response = ai.models.generate_content(
-            model="gemini-2.5-flash", contents=prompt
+            model="gemini-2.0-flash", contents=prompt
         )
         send_telegram_msg(target_chat, response.text)
     except Exception as e:
@@ -486,7 +486,7 @@ async def receive_health_data(request: Request):
 
     try:
         response = ai.models.generate_content(
-            model="gemini-2.5-flash", contents=prompt
+            model="gemini-2.0-flash", contents=prompt
         )
         reply = response.text
     except Exception as e:
@@ -556,14 +556,20 @@ async def handle_telegram_chat(request: Request):
         """
 
         try:
+            # Updated to actively supported model identifier
             response = ai.models.generate_content(
-                model="gemini-2.5-flash", contents=prompt
+                model="gemini-2.0-flash", contents=prompt
             )
-            
+
             raw_text = response.text.strip()
             if "```" in raw_text:
-                raw_text = raw_text.split("```")[1].replace("json", "").replace("```", "").strip()
-            
+                raw_text = (
+                    raw_text.split("```")[1]
+                    .replace("json", "")
+                    .replace("```", "")
+                    .strip()
+                )
+
             parsed = json.loads(raw_text)
             reply = parsed.get("reply_text", "Got it!")
 
@@ -577,24 +583,38 @@ async def handle_telegram_chat(request: Request):
                         record = {
                             "chat_id": str(chat_id),
                             "day_of_week": day_abbr,
-                            "workout_type": item.get("workout_type", "Long Run"),
-                            "target_distance_miles": item.get("target_distance_miles", 0),
-                            "updated_at": datetime.now().isoformat()
+                            "workout_type": item.get(
+                                "workout_type", "Long Run"
+                            ),
+                            "target_distance_miles": item.get(
+                                "target_distance_miles", 0
+                            ),
+                            "updated_at": datetime.now().isoformat(),
                         }
-                        db.table("training_plans").upsert(record, on_conflict="chat_id,day_of_week").execute()
-                        print(f"✅ Supabase training_plans updated for {day_abbr}: {record}")
+                        db.table("training_plans").upsert(
+                            record, on_conflict="chat_id,day_of_week"
+                        ).execute()
+                        print(
+                            f"✅ Supabase training_plans updated for {day_abbr}: {record}"
+                        )
 
             # Apply Profile Updates to Supabase
             prof_update = parsed.get("profile_update")
-            if prof_update and isinstance(prof_update, dict) and any(prof_update.values()):
+            if (
+                prof_update
+                and isinstance(prof_update, dict)
+                and any(prof_update.values())
+            ):
                 prof_update["chat_id"] = str(chat_id)
                 prof_update["updated_at"] = datetime.now().isoformat()
-                db.table("athlete_profile").upsert(prof_update, on_conflict="chat_id").execute()
+                db.table("athlete_profile").upsert(
+                    prof_update, on_conflict="chat_id"
+                ).execute()
                 print(f"✅ Supabase athlete_profile updated: {prof_update}")
 
         except Exception as e:
             print(f"❌ Error during AI processing: {e}")
-            reply = "I updated my notes on your run, but had a brief hiccup parsing the database update. Let's keep going!"
+            reply = "I've noted that! Let's keep training hard for your race."
 
         save_chat_turn(chat_id, "coach", reply)
         send_telegram_msg(chat_id, reply)
