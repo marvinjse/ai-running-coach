@@ -169,37 +169,20 @@ def get_weekly_training_plan(chat_id: str):
 
 
 def check_and_update_dynamic_data(chat_id: str, user_text: str):
-    """Uses Gemini to detect if user wants to update their profile or weekly schedule."""
+    """Detects if user wants to update goals or weekly schedule and applies Supabase upsert."""
     if not db or not user_text:
         return
 
-    keywords = [
-        "goal",
-        "target",
-        "race",
-        "schedule",
-        "marathon",
-        "plan",
-        "monday",
-        "tuesday",
-        "wednesday",
-        "thursday",
-        "friday",
-        "saturday",
-        "sunday",
-        "miles",
-    ]
-    if not any(kw in user_text.lower() for kw in keywords):
-        return
-
     extraction_prompt = f"""
-    Analyze this message from a runner:
+    Analyze this message from a runner to their AI coach:
     "{user_text}"
 
-    If they are updating their general goals (race, target date, constraints), return JSON under "profile_update".
-    If they are updating a specific day's workout in their training plan, return JSON under "plan_update".
+    Determine if they are updating their training plan or goal targets.
+    
+    If they mention a workout or distance for a day (e.g. "5 miles on Saturday", "Sat is 5 mi", "make Tuesday a tempo run"):
+    Extract it as "plan_update".
 
-    Expected JSON Format:
+    Return ONLY JSON in this exact structure:
     {{
         "profile_update": {{
             "primary_goal": "string or omit",
@@ -211,29 +194,32 @@ def check_and_update_dynamic_data(chat_id: str, user_text: str):
             {{
                 "day_of_week": "Mon/Tue/Wed/Thu/Fri/Sat/Sun",
                 "workout_type": "Easy Run/Tempo/Long Run/Strength/Rest",
-                "target_distance_miles": number,
-                "target_pace_per_mile": "string",
-                "notes": "string"
+                "target_distance_miles": 5.0,
+                "target_pace_per_mile": "string or omit",
+                "notes": "string or omit"
             }}
         ]
     }}
 
-    If no updates are present, return strictly: {{}}
-    Return ONLY valid JSON.
+    If no goals or workout schedule changes are mentioned, return strictly: {{}}
+    Return ONLY raw valid JSON.
     """
     try:
         response = ai.models.generate_content(
             model="gemini-3.6-flash", contents=extraction_prompt
         )
-        cleaned_text = (
-            response.text.strip()
-            .removeprefix("```json")
-            .removeprefix("```")
-            .removesuffix("```")
-            .strip()
-        )
-        data = json.loads(cleaned_text)
+        raw_text = response.text.strip()
 
+        # Clean JSON markdown formatting
+        if raw_text.startswith("```"):
+            raw_text = raw_text.split("```")[1]
+            if raw_text.startswith("json"):
+                raw_text = raw_text[4:]
+        raw_text = raw_text.strip()
+
+        data = json.loads(raw_text)
+
+        # 1. Handle Profile Updates
         prof = data.get("profile_update")
         if prof and isinstance(prof, dict) and any(prof.values()):
             prof["chat_id"] = str(chat_id)
@@ -241,15 +227,31 @@ def check_and_update_dynamic_data(chat_id: str, user_text: str):
             db.table("athlete_profile").upsert(
                 prof, on_conflict="chat_id"
             ).execute()
+            print(f"✅ Profile updated: {prof}")
 
+        # 2. Handle Plan Updates
         plan = data.get("plan_update")
         if plan and isinstance(plan, list):
             for item in plan:
-                item["chat_id"] = str(chat_id)
-                item["updated_at"] = datetime.now().isoformat()
-                db.table("training_plans").upsert(
-                    item, on_conflict="chat_id,day_of_week"
-                ).execute()
+                if "day_of_week" in item:
+                    # Format day to 3-letter standard ('Sat', 'Tue', etc.)
+                    day_formatted = item["day_of_week"][:3].capitalize()
+                    item["day_of_week"] = day_formatted
+                    item["chat_id"] = str(chat_id)
+                    item["updated_at"] = datetime.now().isoformat()
+
+                    # Preserve existing notes or pace if omitted by LLM
+                    if "target_distance_miles" in item and not item.get(
+                        "workout_type"
+                    ):
+                        item["workout_type"] = "Long Run"
+
+                    db.table("training_plans").upsert(
+                        item, on_conflict="chat_id,day_of_week"
+                    ).execute()
+                    print(
+                        f"✅ Training plan updated for {day_formatted}: {item}"
+                    )
 
     except Exception as e:
         print(f"Dynamic extraction error: {e}")
