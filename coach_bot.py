@@ -29,7 +29,6 @@ MODEL_NAME = "gemini-3.5-flash-lite"
 
 scheduler = BackgroundScheduler(timezone="America/Los_Angeles")
 
-
 # --- HELPER FUNCTIONS ---
 
 
@@ -108,7 +107,7 @@ def save_workout_to_db(payload: dict):
     }
 
     # Insert/Upsert into Supabase 'workouts' table
-    supabase.table("workouts").upsert(record).execute()
+    db.table("workouts").upsert(record).execute()
 
 
 def get_recent_workouts(limit=5):
