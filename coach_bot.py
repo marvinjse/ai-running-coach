@@ -302,6 +302,10 @@ async def receive_health_data(request: Request):
     payload = await request.json()
     save_workout_to_db(payload)
 
+    # If 'silent=true' query param is passed, skip Telegram & Gemini calls (used for backfills)
+    if request.query_params.get("silent") == "true":
+        return {"status": "success", "mode": "silent_backfill"}
+
     val = payload.get("value", {})
     dist_km = val.get("distance_km")
     dur_min = val.get("duration_min")
@@ -314,7 +318,7 @@ async def receive_health_data(request: Request):
         "avg_hr_bpm": val.get("avgHeartRate_bpm"),
         "max_hr_bpm": val.get("maxHeartRate_bpm"),
         "avg_cadence_spm": val.get("avgCadence_spm"),
-        "active_calories": val.get("activeEnergy_kcal"),
+        "active_calories": val.get("activeEnergy_kcal")
     }
 
     target_chat = TELEGRAM_CHAT_ID or "8682930690"
@@ -354,7 +358,6 @@ async def receive_health_data(request: Request):
     save_chat_turn(target_chat, "coach", reply)
     send_telegram_msg(target_chat, reply)
     return {"status": "success"}
-
 
 @app.post("/webhook/telegram")
 @app.post("/webhook/telegram/")
