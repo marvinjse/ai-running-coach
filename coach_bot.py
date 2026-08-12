@@ -64,26 +64,51 @@ def send_telegram_msg(chat_id: str, text: str):
 
 
 def save_workout_to_db(payload: dict):
-    if not db:
-        return
     val = payload.get("value", {})
-    uuid = payload.get("uuid") or f"run_{payload.get('start')}"
+
+    # Extract distance (meters -> km)
+    dist_m = val.get("totalDistance_m") or val.get("totalDistance_n") or val.get("distance_km", 0)
+    if isinstance(dist_m, (int, float)) and dist_m > 0 and "distance_km" not in val:
+        dist_km = round(dist_m / 1000.0, 2)
+    else:
+        dist_km = val.get("distance_km")
+
+    # Extract duration (seconds -> min)
+    dur_s = val.get("duration_s") or val.get("duration_min", 0)
+    if isinstance(dur_s, (int, float)) and dur_s > 0 and "duration_min" not in val:
+        dur_min = round(dur_s / 60.0, 1)
+    else:
+        dur_min = val.get("duration_min")
+
+    # Calculate average pace (min/km)
+    avg_pace = None
+    if dist_km and dur_min and dist_km > 0:
+        pace_dec = dur_min / dist_km
+        p_min = int(pace_dec)
+        p_sec = int(round((pace_dec - p_min) * 60))
+        avg_pace = f"{p_min}:{p_sec:02d} /km"
+
+    # Map remaining metrics
+    avg_hr = val.get("avgHeartRate_bpm") or val.get("avg_hr")
+    max_hr = val.get("maxHeartRate_bpm") or val.get("max_hr")
+    avg_cadence = val.get("avgCadence_spm") or val.get("avg_cadence")
+    active_calories = val.get("totalEnergy_kcal") or val.get("active_calories")
+
     record = {
-        "uuid": uuid,
+        "uuid": payload.get("uuid"),
         "local_date": payload.get("localDate"),
-        "distance_km": val.get("distance_km"),
-        "duration_min": val.get("duration_min"),
-        "avg_pace": val.get("avgPace"),
-        "avg_hr": val.get("avgHeartRate_bpm"),
-        "max_hr": val.get("maxHeartRate_bpm"),
-        "avg_cadence": val.get("avgCadence_spm"),
-        "active_calories": val.get("activeEnergy_kcal"),
-        "raw_payload": payload,
+        "distance_km": dist_km,
+        "duration_min": dur_min,
+        "avg_pace": avg_pace,
+        "avg_hr": avg_hr,
+        "max_hr": max_hr,
+        "avg_cadence": avg_cadence,
+        "active_calories": active_calories,
+        "raw_payload": payload
     }
-    try:
-        db.table("workouts").upsert(record, on_conflict="uuid").execute()
-    except Exception as e:
-        print(f"Supabase workout save error: {e}")
+
+    # Insert/Upsert into Supabase 'workouts' table
+    supabase.table("workouts").upsert(record).execute()
 
 
 def get_recent_workouts(limit=5):
