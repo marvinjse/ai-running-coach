@@ -25,7 +25,7 @@ db: Client = (
 )
 
 # Model String
-MODEL_NAME = "gemini-3.5-flash-lite"
+MODEL_NAME = "gemini-3.6-flash"
 
 scheduler = BackgroundScheduler(timezone="America/Los_Angeles")
 

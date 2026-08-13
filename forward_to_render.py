@@ -5,7 +5,8 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 import requests
 
-RAW_DIR = Path.home() / "Desktop" / "HealthMirror" / "raw"
+# Correct path pointing to your Ubuntu HealthMirror folder
+RAW_DIR = Path.home() / "iCloudDrive" / "HealthMirror" / "raw"
 RENDER_URL = "https://ai-running-coach-ye45.onrender.com/webhook/apple-health"
 STATE_FILE = Path.home() / ".last_synced_run_uuid"
 
@@ -42,7 +43,7 @@ def parse_iso(iso_str):
         return None
 
 
-def fetch_time_series_amount(folder_name, start_dt, end_dt, window_padding_min=3):
+def fetch_time_series_amount(folder_name, start_dt, end_dt, window_padding_min=0):
     """Extracts values from a raw metric folder within a timeframe."""
     target_dir = RAW_DIR / folder_name
     samples = []
@@ -104,11 +105,11 @@ def forward_latest_workout():
         print(f"❌ No running workouts found in {workout_dir}")
         return
 
-    # 2. Grab the latest run
+    # 2. Grab the latest run by start timestamp
     all_runs.sort(key=lambda x: x.get("start", ""))
     latest_run = all_runs[-1]
 
-    # 3. De-duplication Check (Skip if UUID matches the last forwarded run)
+    # 3. De-duplication Check
     run_uuid = latest_run.get("uuid")
     if STATE_FILE.exists() and STATE_FILE.read_text().strip() == run_uuid:
         print(f"ℹ️ Latest run ({latest_run.get('localDate')}) was already forwarded. Skipping post.")
@@ -143,14 +144,13 @@ def forward_latest_workout():
         latest_run["value"]["maxHeartRate_bpm"] = max_hr
 
     # 6. Cadence & Steps
-    if "avgCadence_spm" not in latest_run["value"]:
-        step_samples = fetch_time_series_amount("steps", start_dt, end_dt, window_padding_min=0)
-        if step_samples and dur_s > 0:
-            total_steps = sum(step_samples)
-            latest_run["value"]["totalSteps"] = int(total_steps)
-            latest_run["value"]["avgCadence_spm"] = round(total_steps / (dur_s / 60.0), 1)
+    step_samples = fetch_time_series_amount("steps", start_dt, end_dt, window_padding_min=0)
+    if step_samples and dur_s > 0:
+        total_steps = sum(step_samples)
+        latest_run["value"]["totalSteps"] = int(total_steps)
+        latest_run["value"]["avgCadence_spm"] = round(total_steps / (dur_s / 60.0), 1)
 
-    # 7. VO2 Max (if available)
+    # 7. VO2 Max
     vo2max_val = fetch_latest_vo2max(local_date)
     if vo2max_val:
         latest_run["value"]["vo2Max_mL_kg_min"] = round(vo2max_val, 1)
@@ -161,10 +161,14 @@ def forward_latest_workout():
 
     dist_disp = latest_run["value"].get("distance_km", "N/A")
     pace_disp = latest_run["value"].get("avgPace", "N/A")
+    hr_disp = latest_run["value"].get("avgHeartRate_bpm", "N/A")
+    cad_disp = latest_run["value"].get("avgCadence_spm", "N/A")
 
-    print(f"📦 Forwarding New Workout: {local_date} | {dist_disp} km @ {pace_disp}")
+    print(f"📦 Forwarding Latest Workout:")
+    print(f"   Date: {local_date} | Distance: {dist_disp} km | Pace: {pace_disp}")
+    print(f"   Avg HR: {hr_disp} bpm | Cadence: {cad_disp} spm")
 
-    # 9. POST to Render and save state on success
+    # 9. POST to Render live endpoint (triggers Telegram message & AI Coach analysis)
     response = requests.post(RENDER_URL, json=latest_run)
     print(f"✅ Render HTTP Status: {response.status_code}")
 
