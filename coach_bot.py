@@ -431,7 +431,7 @@ async def handle_telegram_chat(request: Request):
         past_runs = get_recent_workouts(limit=5)
         chat_context = get_recent_chat_history(chat_id, limit=25)
 
-       prompt = f"""
+        prompt = f"""
         You are an AI Running Coach chatting with your athlete on Telegram.
 
         {athlete_profile}
