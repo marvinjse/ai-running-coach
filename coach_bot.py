@@ -449,7 +449,8 @@ async def handle_telegram_chat(request: Request):
 
         INSTRUCTIONS:
         1. Answer their message directly as a supportive coach in "reply_text".
-        2. IF they mentioned changing a race goal or weekly schedule (e.g., "Saturday run is 5 miles"), extract those updates under "plan_update" or "profile_update".
+        2. IF they mentioned changing a race goal or weekly running schedule, extract those under "plan_update" or "profile_update".
+        3. IF they mentioned adding, modifying, or completing a strength/gym exercise (e.g., "40 lbs Goblet Squats for 3 sets of 10 on Tue"), extract it under "plan_exercise_update".
 
         Output STRICT JSON matching this format:
         {{
@@ -459,6 +460,16 @@ async def handle_telegram_chat(request: Request):
               "day_of_week": "Sat",
               "target_distance_miles": 5.0,
               "workout_type": "Long Run"
+            }}
+          ],
+          "plan_exercise_update": [
+            {{
+              "day_of_week": "Tue",
+              "exercise_name": "Goblet Squats",
+              "target_sets": 3,
+              "target_reps": 10,
+              "target_weight_lbs": 40.0,
+              "notes": "optional string or notes"
             }}
           ],
           "profile_update": {{
@@ -479,7 +490,7 @@ async def handle_telegram_chat(request: Request):
             parsed = json.loads(response.text)
             reply = parsed.get("reply_text", "Got it!")
 
-            # Update Training Plan in Supabase
+            # 1. Update Training Plan in Supabase
             plan_updates = parsed.get("plan_update", [])
             if isinstance(plan_updates, list) and len(plan_updates) > 0:
                 for item in plan_updates:
@@ -490,25 +501,40 @@ async def handle_telegram_chat(request: Request):
                             "chat_id": str(chat_id),
                             "day_of_week": day_abbr,
                             "workout_type": item.get("workout_type", "Long Run"),
-                            "target_distance_miles": item.get(
-                                "target_distance_miles", 0
-                            ),
+                            "target_distance_miles": item.get("target_distance_miles", 0),
                             "updated_at": datetime.now().isoformat(),
                         }
                         db.table("training_plans").upsert(
                             record, on_conflict="chat_id,day_of_week"
                         ).execute()
-                        print(
-                            f"✅ Supabase training_plans updated for {day_abbr}: {record}"
-                        )
+                        print(f"✅ Supabase training_plans updated for {day_abbr}: {record}")
 
-            # Update Athlete Profile in Supabase
+            # 2. Update Gym Exercises in Supabase
+            exercise_updates = parsed.get("plan_exercise_update", [])
+            if isinstance(exercise_updates, list) and len(exercise_updates) > 0:
+                for item in exercise_updates:
+                    day = item.get("day_of_week")
+                    ex_name = item.get("exercise_name")
+                    if day and ex_name:
+                        day_abbr = day[:3].capitalize()
+                        ex_record = {
+                            "chat_id": str(chat_id),
+                            "day_of_week": day_abbr,
+                            "exercise_name": ex_name,
+                            "target_sets": item.get("target_sets", 3),
+                            "target_reps": item.get("target_reps", 10),
+                            "target_weight_lbs": item.get("target_weight_lbs", 0),
+                            "notes": item.get("notes", ""),
+                        }
+                        # Insert new or update existing exercise
+                        db.table("plan_exercises").upsert(
+                            ex_record, on_conflict="chat_id,day_of_week,exercise_name"
+                        ).execute()
+                        print(f"✅ Supabase plan_exercises updated: {ex_record}")
+
+            # 3. Update Athlete Profile in Supabase
             prof_update = parsed.get("profile_update")
-            if (
-                prof_update
-                and isinstance(prof_update, dict)
-                and any(prof_update.values())
-            ):
+            if prof_update and isinstance(prof_update, dict) and any(prof_update.values()):
                 prof_update["chat_id"] = str(chat_id)
                 prof_update["updated_at"] = datetime.now().isoformat()
                 db.table("athlete_profile").upsert(
@@ -518,7 +544,7 @@ async def handle_telegram_chat(request: Request):
 
         except Exception as e:
             print(f"❌ Error during AI processing: {e}")
-            reply = "I've noted that! Let's keep working toward your race."
+            reply = "I've noted that! Let's keep working toward your goals."
 
         save_chat_turn(chat_id, "coach", reply)
         send_telegram_msg(chat_id, reply)
