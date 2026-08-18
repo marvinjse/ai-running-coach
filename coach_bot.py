@@ -431,7 +431,7 @@ async def handle_telegram_chat(request: Request):
         past_runs = get_recent_workouts(limit=5)
         chat_context = get_recent_chat_history(chat_id, limit=25)
 
-        prompt = f"""
+       prompt = f"""
         You are an AI Running Coach chatting with your athlete on Telegram.
 
         {athlete_profile}
@@ -449,19 +449,14 @@ async def handle_telegram_chat(request: Request):
 
         INSTRUCTIONS:
         1. Answer their message directly as a supportive coach in "reply_text".
-        2. IF they mentioned changing a race goal or weekly running schedule, extract those under "plan_update" or "profile_update".
-        3. IF they mentioned adding, modifying, or completing a strength/gym exercise (e.g., "40 lbs Goblet Squats for 3 sets of 10 on Tue"), extract it under "plan_exercise_update".
+        2. IF they mentioned adding, modifying, or completing a strength/gym exercise (e.g., "40 lbs Goblet Squats for 3 sets of 10 on Tue"), extract it under "plan_exercise_update".
+
+        CRITICAL: Always extract numeric weights into "target_weight_lbs".
 
         Output STRICT JSON matching this format:
         {{
           "reply_text": "Your conversational reply to the runner here...",
-          "plan_update": [
-            {{
-              "day_of_week": "Sat",
-              "target_distance_miles": 5.0,
-              "workout_type": "Long Run"
-            }}
-          ],
+          "plan_update": [],
           "plan_exercise_update": [
             {{
               "day_of_week": "Tue",
@@ -472,10 +467,7 @@ async def handle_telegram_chat(request: Request):
               "notes": "optional string or notes"
             }}
           ],
-          "profile_update": {{
-            "primary_goal": "optional string",
-            "target_time": "optional string"
-          }}
+          "profile_update": {{}}
         }}
         """
 
@@ -509,7 +501,7 @@ async def handle_telegram_chat(request: Request):
                         ).execute()
                         print(f"✅ Supabase training_plans updated for {day_abbr}: {record}")
 
-            # 2. Update Gym Exercises in Supabase
+           # 2. Update Gym Exercises in Supabase
             exercise_updates = parsed.get("plan_exercise_update", [])
             if isinstance(exercise_updates, list) and len(exercise_updates) > 0:
                 for item in exercise_updates:
@@ -517,18 +509,29 @@ async def handle_telegram_chat(request: Request):
                     ex_name = item.get("exercise_name")
                     if day and ex_name:
                         day_abbr = day[:3].capitalize()
+                        
+                        # Extract weight checking multiple possible key names
+                        weight_val = (
+                            item.get("target_weight_lbs") 
+                            or item.get("weight_lbs") 
+                            or item.get("weight") 
+                            or 0
+                        )
+
                         ex_record = {
                             "chat_id": str(chat_id),
                             "day_of_week": day_abbr,
                             "exercise_name": ex_name,
                             "target_sets": item.get("target_sets", 3),
                             "target_reps": item.get("target_reps", 10),
-                            "target_weight_lbs": item.get("target_weight_lbs", 0),
+                            "target_weight_lbs": float(weight_val),
                             "notes": item.get("notes", ""),
                         }
-                        # Insert new or update existing exercise
+
+                        # Upsert and explicitly specify on_conflict
                         db.table("plan_exercises").upsert(
-                            ex_record, on_conflict="chat_id,day_of_week,exercise_name"
+                            ex_record, 
+                            on_conflict="chat_id,day_of_week,exercise_name"
                         ).execute()
                         print(f"✅ Supabase plan_exercises updated: {ex_record}")
 
