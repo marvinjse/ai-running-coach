@@ -248,37 +248,42 @@ def get_recent_chat_history(chat_id: str, limit=25):
 # --- SCHEDULER JOBS ---
 
 
+# Helper to fetch strength exercises
+def get_plan_exercises(chat_id: str, day_of_week: str = None):
+    if not db:
+        return []
+    try:
+        query = db.table("plan_exercises").select("*").eq("chat_id", str(chat_id))
+        if day_of_week:
+            query = query.eq("day_of_week", day_of_week)
+        res = query.execute()
+        return res.data or []
+    except Exception as e:
+        print(f"Error fetching plan exercises: {e}")
+        return []
+
+# Update send_daily_reminder()
 def send_daily_reminder():
     target_chat = TELEGRAM_CHAT_ID or "8682930690"
     training_plan = get_weekly_training_plan(target_chat)
-    today_day = datetime.now().strftime("%a")  # e.g., 'Mon', 'Tue'
+    today_day = datetime.now().strftime("%a")
 
-    # Find today's plan item
     today_plan = next((item for item in training_plan if item.get("day_of_week") == today_day), None)
 
-    # Optional: Skip sending if today is marked as a 'Rest' day
     if today_plan and today_plan.get("workout_type") == "Rest":
         print(f"Skipping daily reminder: Today ({today_day}) is a rest day.")
         return
 
-    # Otherwise, generate and send the reminder as usual...
+    today_exercises = get_plan_exercises(target_chat, today_day)
 
     prompt = f"""
-    You are an AI Running Coach sending a short, motivating morning reminder (2-3 sentences) to your athlete on Telegram.
+    You are an AI Running Coach sending a short, motivating morning reminder (2-3 sentences max) to your athlete on Telegram.
 
-    {athlete_profile}
+    Today is {today_day}.
+    Today's Workout: {json.dumps(today_plan, indent=2)}
+    Today's Planned Exercises: {json.dumps(today_exercises, indent=2)}
 
-    Weekly Training Plan:
-    ```json
-    {json.dumps(training_plan, indent=2)}
-    ```
-
-    Recent Completed Workouts:
-    ```json
-    {json.dumps(past_runs, indent=2)}
-    ```
-
-    Today is {today_day}. Remind them of today's target workout according to the plan. Keep it energetic!
+    If today is a Strength day, list their specific exercises, target sets, reps, and weights. Keep it energetic and concise!
     """
     try:
         response = ai.models.generate_content(model=MODEL_NAME, contents=prompt)
