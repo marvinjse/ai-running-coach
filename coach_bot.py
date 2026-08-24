@@ -27,10 +27,10 @@ db: Client = (
 # Model String
 MODEL_NAME = "gemini-3.6-flash"
 
+# Scheduler configured for Pacific Time Zone
 scheduler = BackgroundScheduler(timezone="America/Los_Angeles")
 
 # --- HELPER FUNCTIONS ---
-
 
 def km_to_miles(km_val):
     if km_val is None:
@@ -50,6 +50,7 @@ def pace_km_to_miles(dist_km, dur_min):
 
 def send_telegram_msg(chat_id: str, text: str):
     if not TELEGRAM_BOT_TOKEN:
+        print("⚠️ TELEGRAM_BOT_TOKEN is missing.")
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     res = requests.post(
@@ -61,7 +62,6 @@ def send_telegram_msg(chat_id: str, text: str):
 
 # --- DATABASE FUNCTIONS ---
 
-
 def save_workout_to_db(payload: dict):
     if not db:
         print("⚠️ Supabase client 'db' is not initialized.")
@@ -70,7 +70,6 @@ def save_workout_to_db(payload: dict):
     val = payload.get("value") or {}
     meta = payload.get("metadata") or {}
 
-    # 1. Distance (Meters -> KM)
     dist_m = val.get("totalDistance_m") or val.get("totalDistance_n")
     if dist_m is not None:
         try:
@@ -83,7 +82,6 @@ def save_workout_to_db(payload: dict):
         except (ValueError, TypeError):
             dist_km = 0.0
 
-    # 2. Duration (Seconds -> Min)
     dur_s = val.get("duration_s")
     if dur_s is not None:
         try:
@@ -96,7 +94,6 @@ def save_workout_to_db(payload: dict):
         except (ValueError, TypeError):
             dur_min = 0.0
 
-    # 3. Average Pace Calculation
     avg_pace = None
     if dist_km > 0 and dur_min > 0:
         pace_dec = dur_min / dist_km
@@ -107,7 +104,6 @@ def save_workout_to_db(payload: dict):
             p_sec = 0
         avg_pace = f"{p_min}:{p_sec:02d} /km"
 
-    # 4. Helper for floats checking multiple possible key locations
     def extract_float(keys):
         for k in keys:
             v = val.get(k) or payload.get(k) or meta.get(k)
@@ -214,6 +210,20 @@ def get_weekly_training_plan(chat_id: str):
         return []
 
 
+def get_plan_exercises(chat_id: str, day_of_week: str = None):
+    if not db:
+        return []
+    try:
+        query = db.table("plan_exercises").select("*").eq("chat_id", str(chat_id))
+        if day_of_week:
+            query = query.eq("day_of_week", day_of_week)
+        res = query.execute()
+        return res.data or []
+    except Exception as e:
+        print(f"Error fetching plan exercises: {e}")
+        return []
+
+
 def save_chat_turn(chat_id: str, sender: str, text: str):
     if not db:
         return
@@ -247,101 +257,77 @@ def get_recent_chat_history(chat_id: str, limit=25):
 
 # --- SCHEDULER JOBS ---
 
-
-# Helper to fetch strength exercises
-def get_plan_exercises(chat_id: str, day_of_week: str = None):
-    if not db:
-        return []
-    try:
-        query = db.table("plan_exercises").select("*").eq("chat_id", str(chat_id))
-        if day_of_week:
-            query = query.eq("day_of_week", day_of_week)
-        res = query.execute()
-        return res.data or []
-    except Exception as e:
-        print(f"Error fetching plan exercises: {e}")
-        return []
-
-# Update send_daily_reminder()
-def send_daily_reminder():
+def run_daily_reminder():
+    """Fires automatically via APScheduler at 7:30 AM PST."""
     target_chat = TELEGRAM_CHAT_ID or "8682930690"
-    training_plan = get_weekly_training_plan(target_chat)
-    today_day = datetime.now().strftime("%a")
+    today_abbr = datetime.now().strftime("%a")
 
-    today_plan = next((item for item in training_plan if item.get("day_of_week") == today_day), None)
+    todays_plan_res = db.table("training_plans").select("*").eq("chat_id", target_chat).eq("day_of_week", today_abbr).execute() if db else None
+    todays_plan = todays_plan_res.data[0] if (todays_plan_res and todays_plan_res.data) else None
+    todays_exercises = get_plan_exercises(target_chat, today_abbr)
 
-    if today_plan and today_plan.get("workout_type") == "Rest":
-        print(f"Skipping daily reminder: Today ({today_day}) is a rest day.")
+    if not todays_plan and not todays_exercises:
+        print(f"ℹ️ No training plan or exercise entries found for today ({today_abbr}).")
         return
 
-    today_exercises = get_plan_exercises(target_chat, today_day)
+    workout_type = todays_plan.get("workout_type", "Rest") if todays_plan else "Strength"
+    if workout_type.lower() == "rest" and not todays_exercises:
+        print(f"😴 Skipping reminder: Today ({today_abbr}) is a Rest day with no assigned strength exercises.")
+        return
+
+    target_dist = todays_plan.get("target_distance_miles", 0) if todays_plan else 0
+    target_pace = todays_plan.get("target_pace_per_mile", "N/A") if todays_plan else "N/A"
+    plan_notes = todays_plan.get("notes", "") if todays_plan else ""
 
     prompt = f"""
-    You are an AI Running Coach sending a short, motivating morning reminder (2-3 sentences max) to your athlete on Telegram.
+    You are an AI Running Coach sending a clear, highly motivating morning reminder to your athlete on Telegram.
 
-    Today is {today_day}.
-    Today's Workout: {json.dumps(today_plan, indent=2)}
-    Today's Planned Exercises: {json.dumps(today_exercises, indent=2)}
+    Today is {today_abbr}.
+    
+    Overall Day Overview:
+    - Workout Category: {workout_type}
+    - Target Running Distance: {target_dist} miles
+    - Target Running Pace: {target_pace}
+    - Overall Notes: {plan_notes}
 
-    If today is a Strength day, list their specific exercises, target sets, reps, and weights. Keep it energetic and concise!
+    Assigned Gym/Strength Exercises:
+    {json.dumps(todays_exercises, indent=2)}
+
+    INSTRUCTIONS:
+    1. Remind them of today's running targets (if distance > 0).
+    2. IF there are assigned exercises, list each exercise clearly with target sets, reps, current target weight (lbs), and notes.
+    3. **PROGRESSIVE OVERLOAD RECOMMENDATIONS**:
+       - Provide 1-2 specific Coaching Tips / Progressive Overload recommendations for their strength session.
+       - Suggest when to bump the weight (e.g., "+2.5 to +5 lbs if all sets felt smooth last session"), increase reps, or adjust tempo to build running-specific strength and injury resilience.
+    4. Keep it energetic, well-formatted with bullet points, and concise. Use 1-2 relevant emojis.
+    5. Output raw Markdown text only.
     """
-    try:
-        response = ai.models.generate_content(model=MODEL_NAME, contents=prompt)
-        send_telegram_msg(target_chat, response.text)
-    except Exception as e:
-        print(f"Error sending daily reminder: {e}")
-
-
-def send_weekly_recap():
-    target_chat = TELEGRAM_CHAT_ID or "8682930690"
-    if not db:
-        return
-    seven_days_ago = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
-    athlete_profile = get_athlete_profile(target_chat)
-    training_plan = get_weekly_training_plan(target_chat)
 
     try:
-        res = (
-            db.table("workouts")
-            .select("*")
-            .gte("local_date", seven_days_ago)
-            .execute()
-        )
-        weekly_runs = res.data or []
+        if ai:
+            response = ai.models.generate_content(model=MODEL_NAME, contents=prompt)
+            message = response.text
+        else:
+            lines = [f"🏋️ **Today's Plan ({today_abbr}): {workout_type}**\n"]
+            if target_dist > 0:
+                lines.append(f"• Run: {target_dist} mi @ {target_pace}")
+            if todays_exercises:
+                lines.append("\n**Prescribed Exercises:**")
+                for ex in todays_exercises:
+                    weight_str = f" @ {ex.get('target_weight_lbs')} lbs" if ex.get('target_weight_lbs') else ""
+                    lines.append(f"• {ex.get('exercise_name')}: {ex.get('target_sets')} sets x {ex.get('target_reps')} reps{weight_str}")
+            message = "\n".join(lines)
+
+        print(f"🚀 Sending automated daily reminder for {today_abbr} ({workout_type})...")
+        send_telegram_msg(target_chat, message)
+        print("✅ Daily reminder sent successfully.")
+
     except Exception as e:
-        print(f"Error fetching weekly runs: {e}")
-        return
-
-    prompt = f"""
-    You are an AI Running Coach generating a Weekly Training Recap for your athlete on Telegram.
-
-    {athlete_profile}
-
-    Planned Schedule:
-    ```json
-    {json.dumps(training_plan, indent=2)}
-    ```
-
-    Completed Workouts Past 7 Days:
-    ```json
-    {json.dumps(weekly_runs, indent=2)}
-    ```
-
-    Format using Markdown:
-    1. 📊 **Weekly Totals:** Planned vs. Actual Distance (miles).
-    2. 🏃 **Pace & HR Analysis:** Evaluation of effort and heart rate.
-    3. 🎯 **Progress Toward Goal:** Progress toward target race.
-    4. 💡 **Focus for Next Week:** Key action items for upcoming week.
-    """
-    try:
-        response = ai.models.generate_content(model=MODEL_NAME, contents=prompt)
-        send_telegram_msg(target_chat, response.text)
-    except Exception as e:
-        print(f"Error generating weekly recap: {e}")
+        print(f"❌ Error generating or sending daily reminder: {e}")
 
 
-scheduler.add_job(send_daily_reminder, "cron", hour=7, minute=30)
-scheduler.add_job(send_weekly_recap, "cron", day_of_week="sun", hour=19, minute=0)
+# Register Daily Reminder Job to run every day at 7:30 AM America/Los_Angeles time
+scheduler.add_job(run_daily_reminder, "cron", hour=6, minute=45)
 
 
 @app.on_event("startup")
@@ -351,14 +337,12 @@ def start_scheduler():
 
 # --- WEBHOOK ENDPOINTS ---
 
-
 @app.post("/webhook/apple-health")
 @app.post("/webhook/apple-health/")
 async def receive_health_data(request: Request):
     payload = await request.json()
     save_workout_to_db(payload)
 
-    # If 'silent=true' query param is passed, skip Telegram & Gemini calls (used for backfills)
     if request.query_params.get("silent") == "true":
         return {"status": "success", "mode": "silent_backfill"}
 
@@ -415,6 +399,7 @@ async def receive_health_data(request: Request):
     send_telegram_msg(target_chat, reply)
     return {"status": "success"}
 
+
 @app.post("/webhook/telegram")
 @app.post("/webhook/telegram/")
 async def handle_telegram_chat(request: Request):
@@ -428,16 +413,21 @@ async def handle_telegram_chat(request: Request):
 
         athlete_profile = get_athlete_profile(chat_id)
         training_plan = get_weekly_training_plan(chat_id)
+        all_exercises = get_plan_exercises(chat_id)
         past_runs = get_recent_workouts(limit=5)
         chat_context = get_recent_chat_history(chat_id, limit=25)
 
         prompt = f"""
         You are an AI Running Coach chatting with your athlete on Telegram.
 
+        Athlete Profile:
         {athlete_profile}
 
-        Stored Weekly Training Plan:
+        Stored Weekly Running Plan:
         {json.dumps(training_plan, indent=2)}
+
+        Stored Detailed Strength/Gym Exercises (Tue/Thu/etc.):
+        {json.dumps(all_exercises, indent=2)}
 
         Recent Workout History (Imperial):
         {json.dumps(past_runs, indent=2)}
@@ -449,14 +439,23 @@ async def handle_telegram_chat(request: Request):
 
         INSTRUCTIONS:
         1. Answer their message directly as a supportive coach in "reply_text".
-        2. IF they mentioned adding, modifying, or completing a strength/gym exercise (e.g., "40 lbs Goblet Squats for 3 sets of 10 on Tue"), extract it under "plan_exercise_update".
+        2. IF they ask about their strength exercises for any day, accurately list every assigned exercise, target set, rep, weight, and note.
+        3. IF they mention changing running distance, target pace, or workout type for any day (e.g. Saturday long run pace), extract it under "plan_update".
+        4. IF they mention adding, modifying, or completing a strength/gym exercise (e.g. "40 lbs Goblet Squats for 3 sets of 10 on Tue"), extract it under "plan_exercise_update".
 
         CRITICAL: Always extract numeric weights into "target_weight_lbs".
 
         Output STRICT JSON matching this format:
         {{
           "reply_text": "Your conversational reply to the runner here...",
-          "plan_update": [],
+          "plan_update": [
+            {{
+              "day_of_week": "Sat",
+              "target_distance_miles": 8.0,
+              "target_pace_per_mile": "8:00",
+              "workout_type": "Long Run"
+            }}
+          ],
           "plan_exercise_update": [
             {{
               "day_of_week": "Tue",
@@ -472,7 +471,6 @@ async def handle_telegram_chat(request: Request):
         """
 
         try:
-            # Force structured JSON mode to prevent parsing exceptions
             response = ai.models.generate_content(
                 model=MODEL_NAME,
                 contents=prompt,
@@ -482,7 +480,6 @@ async def handle_telegram_chat(request: Request):
             parsed = json.loads(response.text)
             reply = parsed.get("reply_text", "Got it!")
 
-            # 1. Update Training Plan in Supabase
             plan_updates = parsed.get("plan_update", [])
             if isinstance(plan_updates, list) and len(plan_updates) > 0:
                 for item in plan_updates:
@@ -492,16 +489,15 @@ async def handle_telegram_chat(request: Request):
                         record = {
                             "chat_id": str(chat_id),
                             "day_of_week": day_abbr,
-                            "workout_type": item.get("workout_type", "Long Run"),
+                            "workout_type": item.get("workout_type", "Running"),
                             "target_distance_miles": item.get("target_distance_miles", 0),
+                            "target_pace_per_mile": item.get("target_pace_per_mile") or item.get("target_pace") or "N/A",
                             "updated_at": datetime.now().isoformat(),
                         }
                         db.table("training_plans").upsert(
                             record, on_conflict="chat_id,day_of_week"
                         ).execute()
-                        print(f"✅ Supabase training_plans updated for {day_abbr}: {record}")
 
-           # 2. Update Gym Exercises in Supabase
             exercise_updates = parsed.get("plan_exercise_update", [])
             if isinstance(exercise_updates, list) and len(exercise_updates) > 0:
                 for item in exercise_updates:
@@ -509,8 +505,6 @@ async def handle_telegram_chat(request: Request):
                     ex_name = item.get("exercise_name")
                     if day and ex_name:
                         day_abbr = day[:3].capitalize()
-                        
-                        # Extract weight checking multiple possible key names
                         weight_val = (
                             item.get("target_weight_lbs") 
                             or item.get("weight_lbs") 
@@ -528,14 +522,11 @@ async def handle_telegram_chat(request: Request):
                             "notes": item.get("notes", ""),
                         }
 
-                        # Upsert and explicitly specify on_conflict
                         db.table("plan_exercises").upsert(
                             ex_record, 
                             on_conflict="chat_id,day_of_week,exercise_name"
                         ).execute()
-                        print(f"✅ Supabase plan_exercises updated: {ex_record}")
 
-            # 3. Update Athlete Profile in Supabase
             prof_update = parsed.get("profile_update")
             if prof_update and isinstance(prof_update, dict) and any(prof_update.values()):
                 prof_update["chat_id"] = str(chat_id)
@@ -543,7 +534,6 @@ async def handle_telegram_chat(request: Request):
                 db.table("athlete_profile").upsert(
                     prof_update, on_conflict="chat_id"
                 ).execute()
-                print(f"✅ Supabase athlete_profile updated: {prof_update}")
 
         except Exception as e:
             print(f"❌ Error during AI processing: {e}")
