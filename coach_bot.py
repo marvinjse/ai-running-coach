@@ -326,13 +326,22 @@ def run_daily_reminder():
         print(f"❌ Error generating or sending daily reminder: {e}")
 
 
-# Register Daily Reminder Job to run every day at 7:30 AM America/Los_Angeles time
-scheduler.add_job(run_daily_reminder, "cron", hour=6, minute=45)
+# 1. Allow a 1-hour grace period for missed jobs (e.g. if Render was asleep at 7:30 AM)
+scheduler.add_job(
+    run_daily_reminder, 
+    "cron", 
+    hour=6, 
+    minute=45, 
+    misfire_grace_time=3600,  # Runs the reminder if Render wakes up within 1 hour of 7:30 AM
+    coalesce=True
+)
 
-
+# 2. Add logging to startup so you can see it in Render logs
 @app.on_event("startup")
 def start_scheduler():
     scheduler.start()
+    print("⏰ APScheduler started successfully!")
+    print(f"📅 Next scheduled daily reminder job: {scheduler.get_jobs()}")
 
 
 # --- WEBHOOK ENDPOINTS ---
@@ -543,3 +552,14 @@ async def handle_telegram_chat(request: Request):
         send_telegram_msg(chat_id, reply)
 
     return {"status": "ok"}
+
+@app.get("/")
+@app.get("/health")
+def health_check():
+    return {"status": "ok", "service": "AI Running Coach API"}
+
+@app.get("/trigger-reminder")
+def trigger_reminder_now():
+    print("🧪 Manually triggering daily workout reminder...")
+    run_daily_reminder()
+    return {"status": "success", "message": "Daily reminder process executed. Check Telegram!"}
