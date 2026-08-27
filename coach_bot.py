@@ -327,14 +327,14 @@ def run_daily_reminder():
 
 
 # 1. Allow a 1-hour grace period for missed jobs (e.g. if Render was asleep at 7:30 AM)
-scheduler.add_job(
-    run_daily_reminder, 
-    "cron", 
-    hour=6, 
-    minute=45, 
-    misfire_grace_time=3600,  # Runs the reminder if Render wakes up within 1 hour of 7:30 AM
-    coalesce=True
-)
+#scheduler.add_job(
+#    run_daily_reminder, 
+#    "cron", 
+#    hour=6, 
+#    minute=45, 
+#    misfire_grace_time=3600,  # Runs the reminder if Render wakes up within 1 hour of 7:30 AM
+#    coalesce=True
+#)
 
 # 2. Add logging to startup so you can see it in Render logs
 @app.on_event("startup")
