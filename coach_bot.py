@@ -1,5 +1,6 @@
 import json
 import os
+import time
 from datetime import datetime, timedelta
 from apscheduler.schedulers.background import BackgroundScheduler
 from fastapi import FastAPI, Request
@@ -27,8 +28,39 @@ db: Client = (
 # Model String
 MODEL_NAME = "gemini-3.6-flash"
 
-# Scheduler configured for Pacific Time Zone
+# Scheduler (Background tasks handled locally via Ubuntu cron, but kept configured for timezones)
 scheduler = BackgroundScheduler(timezone="America/Los_Angeles")
+
+# --- RESILIENT AI CALL HELPER ---
+
+def generate_ai_response(prompt: str, is_json: bool = False):
+    """Calls Gemini with automatic retries and fallback to Flash-Lite on 503 errors."""
+    if not ai:
+        raise Exception("Gemini client is not initialized.")
+
+    models_to_try = [MODEL_NAME, "gemini-3.5-flash-lite"]
+    config = {"response_mime_type": "application/json"} if is_json else None
+
+    for model in models_to_try:
+        for attempt in range(2):  # Try up to 2 times per model
+            try:
+                if config:
+                    return ai.models.generate_content(
+                        model=model, contents=prompt, config=config
+                    )
+                else:
+                    return ai.models.generate_content(
+                        model=model, contents=prompt
+                    )
+            except Exception as e:
+                err_str = str(e)
+                if "503" in err_str or "UNAVAILABLE" in err_str or "429" in err_str:
+                    print(f"⚠️ {model} hit capacity limit (Attempt {attempt + 1}). Retrying in 2s...")
+                    time.sleep(2)
+                else:
+                    raise e
+
+    raise Exception("All Gemini models are currently experiencing high demand.")
 
 # --- HELPER FUNCTIONS ---
 
@@ -133,7 +165,7 @@ def save_workout_to_db(payload: dict):
         print(f"Supabase Upsert Error: {e}")
 
 
-def get_recent_workouts(limit=5):
+def get_recent_workouts(limit=15):
     if not db:
         return []
     try:
@@ -235,7 +267,7 @@ def save_chat_turn(chat_id: str, sender: str, text: str):
         print(f"Chat save error: {e}")
 
 
-def get_recent_chat_history(chat_id: str, limit=25):
+def get_recent_chat_history(chat_id: str, limit=50):
     if not db:
         return ""
     try:
@@ -258,7 +290,7 @@ def get_recent_chat_history(chat_id: str, limit=25):
 # --- SCHEDULER JOBS ---
 
 def run_daily_reminder():
-    """Fires automatically via APScheduler at 7:30 AM PST."""
+    """Triggered locally or manually via API endpoint."""
     target_chat = TELEGRAM_CHAT_ID or "8682930690"
     today_abbr = datetime.now().strftime("%a")
 
@@ -304,47 +336,35 @@ def run_daily_reminder():
     """
 
     try:
-        if ai:
-            response = ai.models.generate_content(model=MODEL_NAME, contents=prompt)
-            message = response.text
-        else:
-            lines = [f"🏋️ **Today's Plan ({today_abbr}): {workout_type}**\n"]
-            if target_dist > 0:
-                lines.append(f"• Run: {target_dist} mi @ {target_pace}")
-            if todays_exercises:
-                lines.append("\n**Prescribed Exercises:**")
-                for ex in todays_exercises:
-                    weight_str = f" @ {ex.get('target_weight_lbs')} lbs" if ex.get('target_weight_lbs') else ""
-                    lines.append(f"• {ex.get('exercise_name')}: {ex.get('target_sets')} sets x {ex.get('target_reps')} reps{weight_str}")
-            message = "\n".join(lines)
-
+        response = generate_ai_response(prompt, is_json=False)
+        message = response.text
         print(f"🚀 Sending automated daily reminder for {today_abbr} ({workout_type})...")
         send_telegram_msg(target_chat, message)
         print("✅ Daily reminder sent successfully.")
-
     except Exception as e:
         print(f"❌ Error generating or sending daily reminder: {e}")
 
 
-# 1. Allow a 1-hour grace period for missed jobs (e.g. if Render was asleep at 7:30 AM)
-#scheduler.add_job(
-#    run_daily_reminder, 
-#    "cron", 
-#    hour=6, 
-#    minute=45, 
-#    misfire_grace_time=3600,  # Runs the reminder if Render wakes up within 1 hour of 7:30 AM
-#    coalesce=True
-#)
-
-# 2. Add logging to startup so you can see it in Render logs
 @app.on_event("startup")
 def start_scheduler():
     scheduler.start()
-    print("⏰ APScheduler started successfully!")
-    print(f"📅 Next scheduled daily reminder job: {scheduler.get_jobs()}")
+    print("⏰ Background scheduler booted.")
 
 
-# --- WEBHOOK ENDPOINTS ---
+# --- ENDPOINTS ---
+
+@app.get("/")
+@app.get("/health")
+def health_check():
+    return {"status": "ok", "service": "AI Running Coach API"}
+
+
+@app.get("/trigger-reminder")
+def trigger_reminder_now():
+    print("🧪 Manually triggering daily workout reminder...")
+    run_daily_reminder()
+    return {"status": "success", "message": "Daily reminder executed. Check Telegram!"}
+
 
 @app.post("/webhook/apple-health")
 @app.post("/webhook/apple-health/")
@@ -373,11 +393,13 @@ async def receive_health_data(request: Request):
     target_chat = TELEGRAM_CHAT_ID or "8682930690"
     athlete_profile = get_athlete_profile(target_chat)
     training_plan = get_weekly_training_plan(target_chat)
-    past_runs = get_recent_workouts(limit=5)
+    past_runs = get_recent_workouts(limit=15)
+    recent_chat = get_recent_chat_history(target_chat, limit=50)
 
     prompt = f"""
-    You are an expert AI Running Coach.
+    You are an expert, highly analytical AI Running Coach reviewing a newly uploaded workout.
 
+    Athlete Profile & Goals:
     {athlete_profile}
 
     Weekly Planned Schedule:
@@ -385,21 +407,31 @@ async def receive_health_data(request: Request):
     {json.dumps(training_plan, indent=2)}
     ```
 
-    Latest Logged Workout (Imperial):
+    JUST COMPLETED WORKOUT (Imperial):
     ```json
     {json.dumps(imperial_latest_summary, indent=2)}
     ```
 
-    Recent Workout History:
+    RECENT WORKOUT HISTORY (Last 15 Runs):
     ```json
     {json.dumps(past_runs, indent=2)}
     ```
 
-    Provide a concise workout summary for Telegram in Imperial units. Compare this effort against their planned target for today.
+    RECENT CHAT CONTEXT WITH ATHLETE:
+    {recent_chat}
+
+    INSTRUCTIONS & COACHING ANALYSIS:
+    1. **Workout Breakdown:** Briefly summarize distance, pace, and HR/effort for today's run.
+    2. **Historical Context & Progress:**
+       - Compare today's pace and HR against their recent average over the past 15 runs. Is HR lower at a similar pace? Are they trending faster/slower?
+       - Check if today's run aligns with their target pace and distance for today's day of the week in the training plan.
+    3. **Actionable Recommendations:**
+       - Provide 2 specific, actionable takeaways for their next workout or rest period based on their rolling volume, recent fatigue/pain mentioned in chat, or upcoming target runs.
+    4. Keep it engaging, clear, and well-structured using Markdown bullets and emojis.
     """
 
     try:
-        response = ai.models.generate_content(model=MODEL_NAME, contents=prompt)
+        response = generate_ai_response(prompt, is_json=False)
         reply = response.text
     except Exception as e:
         reply = f"Workout saved, but error generating AI analysis: {e}"
@@ -423,8 +455,8 @@ async def handle_telegram_chat(request: Request):
         athlete_profile = get_athlete_profile(chat_id)
         training_plan = get_weekly_training_plan(chat_id)
         all_exercises = get_plan_exercises(chat_id)
-        past_runs = get_recent_workouts(limit=5)
-        chat_context = get_recent_chat_history(chat_id, limit=25)
+        past_runs = get_recent_workouts(limit=15)
+        chat_context = get_recent_chat_history(chat_id, limit=50)
 
         prompt = f"""
         You are an AI Running Coach chatting with your athlete on Telegram.
@@ -435,7 +467,7 @@ async def handle_telegram_chat(request: Request):
         Stored Weekly Running Plan:
         {json.dumps(training_plan, indent=2)}
 
-        Stored Detailed Strength/Gym Exercises (Tue/Thu/etc.):
+        Stored Detailed Strength/Gym Exercises:
         {json.dumps(all_exercises, indent=2)}
 
         Recent Workout History (Imperial):
@@ -449,8 +481,8 @@ async def handle_telegram_chat(request: Request):
         INSTRUCTIONS:
         1. Answer their message directly as a supportive coach in "reply_text".
         2. IF they ask about their strength exercises for any day, accurately list every assigned exercise, target set, rep, weight, and note.
-        3. IF they mention changing running distance, target pace, or workout type for any day (e.g. Saturday long run pace), extract it under "plan_update".
-        4. IF they mention adding, modifying, or completing a strength/gym exercise (e.g. "40 lbs Goblet Squats for 3 sets of 10 on Tue"), extract it under "plan_exercise_update".
+        3. IF they mention changing running distance, target pace, or workout type for any day, extract it under "plan_update".
+        4. IF they mention adding, modifying, or completing a strength/gym exercise, extract it under "plan_exercise_update".
 
         CRITICAL: Always extract numeric weights into "target_weight_lbs".
 
@@ -480,12 +512,7 @@ async def handle_telegram_chat(request: Request):
         """
 
         try:
-            response = ai.models.generate_content(
-                model=MODEL_NAME,
-                contents=prompt,
-                config={"response_mime_type": "application/json"},
-            )
-
+            response = generate_ai_response(prompt, is_json=True)
             parsed = json.loads(response.text)
             reply = parsed.get("reply_text", "Got it!")
 
@@ -552,14 +579,3 @@ async def handle_telegram_chat(request: Request):
         send_telegram_msg(chat_id, reply)
 
     return {"status": "ok"}
-
-@app.get("/")
-@app.get("/health")
-def health_check():
-    return {"status": "ok", "service": "AI Running Coach API"}
-
-@app.get("/trigger-reminder")
-def trigger_reminder_now():
-    print("🧪 Manually triggering daily workout reminder...")
-    run_daily_reminder()
-    return {"status": "success", "message": "Daily reminder process executed. Check Telegram!"}
