@@ -3,7 +3,7 @@ import os
 import time
 from datetime import datetime, timedelta
 from apscheduler.schedulers.background import BackgroundScheduler
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, BackgroundTasks
 from google import genai
 import requests
 from supabase import Client, create_client
@@ -351,6 +351,139 @@ def start_scheduler():
     print("⏰ Background scheduler booted.")
 
 
+# --- BACKGROUND WORKERS ---
+
+def process_telegram_message(chat_id: str, user_text: str):
+    """Processes Telegram chat in the background to prevent webhook retries."""
+    save_chat_turn(chat_id, "user", user_text)
+
+    athlete_profile = get_athlete_profile(chat_id)
+    training_plan = get_weekly_training_plan(chat_id)
+    all_exercises = get_plan_exercises(chat_id)
+    past_runs = get_recent_workouts(limit=15)
+    chat_context = get_recent_chat_history(chat_id, limit=50)
+
+    prompt = f"""
+    You are an AI Running Coach chatting with your athlete on Telegram.
+
+    Athlete Profile:
+    {athlete_profile}
+
+    Stored Weekly Running Plan:
+    {json.dumps(training_plan, indent=2)}
+
+    Stored Detailed Strength/Gym Exercises:
+    {json.dumps(all_exercises, indent=2)}
+
+    Recent Workout History (Imperial):
+    {json.dumps(past_runs, indent=2)}
+
+    Recent Chat History:
+    {chat_context}
+
+    Athlete's Message: "{user_text}"
+
+    INSTRUCTIONS:
+    1. Answer their message directly as a supportive coach in "reply_text".
+    2. IF they ask about their strength exercises for any day, accurately list every assigned exercise, target set, rep, weight, and note.
+    3. IF they mention changing running distance, target pace, or workout type for any day, extract it under "plan_update".
+    4. IF they mention adding, modifying, or completing a strength/gym exercise, extract it under "plan_exercise_update".
+
+    CRITICAL: Always extract numeric weights into "target_weight_lbs".
+
+    Output STRICT JSON matching this format:
+    {{
+      "reply_text": "Your conversational reply to the runner here...",
+      "plan_update": [
+        {{
+          "day_of_week": "Sat",
+          "target_distance_miles": 8.0,
+          "target_pace_per_mile": "8:00",
+          "workout_type": "Long Run"
+        }}
+      ],
+      "plan_exercise_update": [
+        {{
+          "day_of_week": "Tue",
+          "exercise_name": "Goblet Squats",
+          "target_sets": 3,
+          "target_reps": 10,
+          "target_weight_lbs": 40.0,
+          "notes": "optional string or notes"
+        }}
+      ],
+      "profile_update": {{}}
+    }}
+    """
+
+    try:
+        response = generate_ai_response(prompt, is_json=True)
+        parsed = json.loads(response.text)
+        reply = parsed.get("reply_text", "Got it!")
+
+        plan_updates = parsed.get("plan_update", [])
+        if isinstance(plan_updates, list) and len(plan_updates) > 0:
+            for item in plan_updates:
+                day = item.get("day_of_week")
+                if day:
+                    day_abbr = day[:3].capitalize()
+                    record = {
+                        "chat_id": str(chat_id),
+                        "day_of_week": day_abbr,
+                        "workout_type": item.get("workout_type", "Running"),
+                        "target_distance_miles": item.get("target_distance_miles", 0),
+                        "target_pace_per_mile": item.get("target_pace_per_mile") or item.get("target_pace") or "N/A",
+                        "updated_at": datetime.now().isoformat(),
+                    }
+                    db.table("training_plans").upsert(
+                        record, on_conflict="chat_id,day_of_week"
+                    ).execute()
+
+        exercise_updates = parsed.get("plan_exercise_update", [])
+        if isinstance(exercise_updates, list) and len(exercise_updates) > 0:
+            for item in exercise_updates:
+                day = item.get("day_of_week")
+                ex_name = item.get("exercise_name")
+                if day and ex_name:
+                    day_abbr = day[:3].capitalize()
+                    weight_val = (
+                        item.get("target_weight_lbs") 
+                        or item.get("weight_lbs") 
+                        or item.get("weight") 
+                        or 0
+                    )
+
+                    ex_record = {
+                        "chat_id": str(chat_id),
+                        "day_of_week": day_abbr,
+                        "exercise_name": ex_name,
+                        "target_sets": item.get("target_sets", 3),
+                        "target_reps": item.get("target_reps", 10),
+                        "target_weight_lbs": float(weight_val),
+                        "notes": item.get("notes", ""),
+                    }
+
+                    db.table("plan_exercises").upsert(
+                        ex_record, 
+                        on_conflict="chat_id,day_of_week,exercise_name"
+                    ).execute()
+
+        prof_update = parsed.get("profile_update")
+        if prof_update and isinstance(prof_update, dict) and any(prof_update.values()):
+            prof_update["chat_id"] = str(chat_id)
+            prof_update["updated_at"] = datetime.now().isoformat()
+            db.table("athlete_profile").upsert(
+                prof_update, on_conflict="chat_id"
+            ).execute()
+
+    except Exception as e:
+        print(f"❌ Error during AI processing: {e}")
+        reply = "I've noted that! Let's keep working toward your goals."
+
+    save_chat_turn(chat_id, "coach", reply)
+    send_telegram_msg(chat_id, reply)
+
+
 # --- ENDPOINTS ---
 
 @app.get("/")
@@ -443,139 +576,14 @@ async def receive_health_data(request: Request):
 
 @app.post("/webhook/telegram")
 @app.post("/webhook/telegram/")
-async def handle_telegram_chat(request: Request):
+async def handle_telegram_chat(request: Request, background_tasks: BackgroundTasks):
     data = await request.json()
     message = data.get("message", {})
     chat_id = str(message.get("chat", {}).get("id"))
     user_text = message.get("text", "")
 
     if chat_id and user_text:
-        save_chat_turn(chat_id, "user", user_text)
-
-        athlete_profile = get_athlete_profile(chat_id)
-        training_plan = get_weekly_training_plan(chat_id)
-        all_exercises = get_plan_exercises(chat_id)
-        past_runs = get_recent_workouts(limit=15)
-        chat_context = get_recent_chat_history(chat_id, limit=50)
-
-        prompt = f"""
-        You are an AI Running Coach chatting with your athlete on Telegram.
-
-        Athlete Profile:
-        {athlete_profile}
-
-        Stored Weekly Running Plan:
-        {json.dumps(training_plan, indent=2)}
-
-        Stored Detailed Strength/Gym Exercises:
-        {json.dumps(all_exercises, indent=2)}
-
-        Recent Workout History (Imperial):
-        {json.dumps(past_runs, indent=2)}
-
-        Recent Chat History:
-        {chat_context}
-
-        Athlete's Message: "{user_text}"
-
-        INSTRUCTIONS:
-        1. Answer their message directly as a supportive coach in "reply_text".
-        2. IF they ask about their strength exercises for any day, accurately list every assigned exercise, target set, rep, weight, and note.
-        3. IF they mention changing running distance, target pace, or workout type for any day, extract it under "plan_update".
-        4. IF they mention adding, modifying, or completing a strength/gym exercise, extract it under "plan_exercise_update".
-
-        CRITICAL: Always extract numeric weights into "target_weight_lbs".
-
-        Output STRICT JSON matching this format:
-        {{
-          "reply_text": "Your conversational reply to the runner here...",
-          "plan_update": [
-            {{
-              "day_of_week": "Sat",
-              "target_distance_miles": 8.0,
-              "target_pace_per_mile": "8:00",
-              "workout_type": "Long Run"
-            }}
-          ],
-          "plan_exercise_update": [
-            {{
-              "day_of_week": "Tue",
-              "exercise_name": "Goblet Squats",
-              "target_sets": 3,
-              "target_reps": 10,
-              "target_weight_lbs": 40.0,
-              "notes": "optional string or notes"
-            }}
-          ],
-          "profile_update": {{}}
-        }}
-        """
-
-        try:
-            response = generate_ai_response(prompt, is_json=True)
-            parsed = json.loads(response.text)
-            reply = parsed.get("reply_text", "Got it!")
-
-            plan_updates = parsed.get("plan_update", [])
-            if isinstance(plan_updates, list) and len(plan_updates) > 0:
-                for item in plan_updates:
-                    day = item.get("day_of_week")
-                    if day:
-                        day_abbr = day[:3].capitalize()
-                        record = {
-                            "chat_id": str(chat_id),
-                            "day_of_week": day_abbr,
-                            "workout_type": item.get("workout_type", "Running"),
-                            "target_distance_miles": item.get("target_distance_miles", 0),
-                            "target_pace_per_mile": item.get("target_pace_per_mile") or item.get("target_pace") or "N/A",
-                            "updated_at": datetime.now().isoformat(),
-                        }
-                        db.table("training_plans").upsert(
-                            record, on_conflict="chat_id,day_of_week"
-                        ).execute()
-
-            exercise_updates = parsed.get("plan_exercise_update", [])
-            if isinstance(exercise_updates, list) and len(exercise_updates) > 0:
-                for item in exercise_updates:
-                    day = item.get("day_of_week")
-                    ex_name = item.get("exercise_name")
-                    if day and ex_name:
-                        day_abbr = day[:3].capitalize()
-                        weight_val = (
-                            item.get("target_weight_lbs") 
-                            or item.get("weight_lbs") 
-                            or item.get("weight") 
-                            or 0
-                        )
-
-                        ex_record = {
-                            "chat_id": str(chat_id),
-                            "day_of_week": day_abbr,
-                            "exercise_name": ex_name,
-                            "target_sets": item.get("target_sets", 3),
-                            "target_reps": item.get("target_reps", 10),
-                            "target_weight_lbs": float(weight_val),
-                            "notes": item.get("notes", ""),
-                        }
-
-                        db.table("plan_exercises").upsert(
-                            ex_record, 
-                            on_conflict="chat_id,day_of_week,exercise_name"
-                        ).execute()
-
-            prof_update = parsed.get("profile_update")
-            if prof_update and isinstance(prof_update, dict) and any(prof_update.values()):
-                prof_update["chat_id"] = str(chat_id)
-                prof_update["updated_at"] = datetime.now().isoformat()
-                db.table("athlete_profile").upsert(
-                    prof_update, on_conflict="chat_id"
-                ).execute()
-
-        except Exception as e:
-            print(f"❌ Error during AI processing: {e}")
-            reply = "I've noted that! Let's keep working toward your goals."
-
-        save_chat_turn(chat_id, "coach", reply)
-        send_telegram_msg(chat_id, reply)
+        # Hand off AI execution to a background queue and respond instantly with 200 OK
+        background_tasks.add_task(process_telegram_message, chat_id, user_text)
 
     return {"status": "ok"}
