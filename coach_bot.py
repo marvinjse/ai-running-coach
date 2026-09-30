@@ -34,15 +34,20 @@ scheduler = BackgroundScheduler(timezone="America/Los_Angeles")
 # --- RESILIENT AI CALL HELPER ---
 
 def generate_ai_response(prompt: str, is_json: bool = False):
-    """Calls Gemini with automatic retries and fallback to Flash-Lite on 503 errors."""
+    """Calls Gemini with automatic retries across multiple model tiers."""
     if not ai:
         raise Exception("Gemini client is not initialized.")
 
-    models_to_try = [MODEL_NAME, "gemini-3.5-flash-lite"]
+    # Added gemini-2.5-flash to prevent 503 failures when 3.6/3.5-lite are both at capacity
+    models_to_try = [
+        MODEL_NAME,                # gemini-3.6-flash
+        "gemini-3.5-flash-lite",
+        "gemini-2.5-flash"
+    ]
     config = {"response_mime_type": "application/json"} if is_json else None
 
     for model in models_to_try:
-        for attempt in range(2):  # Try up to 2 times per model
+        for attempt in range(2):
             try:
                 if config:
                     return ai.models.generate_content(
